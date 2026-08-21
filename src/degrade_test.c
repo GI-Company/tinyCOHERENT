@@ -18,9 +18,9 @@
  * in exploration mode." A fixed schedule keeps the swept parameter the
  * only thing that varies between runs.
  *
- * Usage: ./degrade_test <noise_p> <jitter_q> <capacity_divisor>
- * Prints one CSV line: noise_p,jitter_q,capacity_divisor,d_model,param_count,
- *   decay_step,final_accuracy,top1_recovery,mean_importance_src,
+ * Usage: ./degrade_test <noise_p> <jitter_q> <capacity_divisor> [seed]
+ * Prints one CSV line: noise_p,jitter_q,capacity_divisor,seed,d_model,
+ *   param_count,decay_step,final_accuracy,top1_recovery,mean_importance_src,
  *   mean_importance_strongest_other,ratio,leak_fraction */
 #include "tcmodel.h"
 #include "optim.h"
@@ -83,12 +83,17 @@ static float copy_accuracy(const TCParamSet *p, TCCache *c, unsigned int *rng, i
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s <noise_p> <jitter_q> <capacity_divisor>\n", argv[0]);
+        fprintf(stderr, "usage: %s <noise_p> <jitter_q> <capacity_divisor> [seed]\n", argv[0]);
         return 1;
     }
     float noise_p = strtof(argv[1], NULL);
     float jitter_q = strtof(argv[2], NULL);
     int cap_div = atoi(argv[3]);
+    /* seed=0 reproduces the original single-seed sweep exactly (init=555,
+     * train_rng=1, eval_rng=999999); seed>0 derives three well-separated
+     * streams so replicate runs vary both weight init and data order. */
+    unsigned int seed = argc >= 5 ? (unsigned int)atoi(argv[4]) : 0;
+    unsigned int init_seed = seed == 0 ? 555u : (seed * 7919u + 101u);
 
     TCConfig cfg = tc_default_config();
     cfg.d_model = cfg.d_model / cap_div;
@@ -96,13 +101,13 @@ int main(int argc, char **argv) {
     if (cfg.d_model % cfg.n_heads != 0) cfg.d_model -= cfg.d_model % cfg.n_heads;
 
     TCParamSet *p = tc_paramset_create(cfg);
-    tc_paramset_init_random(p, 555);
+    tc_paramset_init_random(p, init_seed);
     TCParamSet *grad = tc_paramset_create(cfg);
     TCCache *cache = tc_cache_create(cfg);
     TCAdam *adam = tc_adam_create(cfg, 5e-3f);
 
-    unsigned int train_rng = 1;
-    unsigned int eval_rng = 999999;
+    unsigned int train_rng = seed == 0 ? 1u : (seed * 104729u + 13u);
+    unsigned int eval_rng = seed == 0 ? 999999u : (seed * 15485863u + 29u);
 
     /* Plateau-triggered lr decay instead of a fixed step or fixed accuracy
      * bar: under jitter, accuracy is capped below 100% for a structural
@@ -191,8 +196,8 @@ int main(int argc, char **argv) {
     float ratio = mean_other > 1e-6f ? mean_src / mean_other : INFINITY;
     float leak_frac = (float)leak_count / n_eval;
 
-    printf("%.2f,%.2f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.2f,%.4f\n",
-           noise_p, jitter_q, cap_div, cfg.d_model, tc_param_count(cfg), step,
+    printf("%.2f,%.2f,%d,%u,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.2f,%.4f\n",
+           noise_p, jitter_q, cap_div, seed, cfg.d_model, tc_param_count(cfg), step,
            final_acc, (float)top1_correct / n_eval, mean_src, mean_other, ratio, leak_frac);
 
     tc_adam_free(adam);
