@@ -141,42 +141,64 @@ static int run_deletion_curve(const char *name, const int *ranked_idx, int n_pos
 }
 
 int main(int argc, char **argv) {
+    /* Embedder is optional and, critically, gets its OWN cache sized to
+     * its OWN config -- gen and emb can be different scales (e.g. testing
+     * a freshly-scaled generative checkpoint before a matching embedder
+     * exists), and sharing one cache sized to gen's config while running
+     * emb's forward pass through it is a real memory-safety bug the
+     * moment the two configs diverge, not just a style issue. */
+    /* argv[2] "-" means "no embedder" explicitly, so argv[3] (prompt
+     * override) can be reached positionally. A hardcoded prompt drawn
+     * from one corpus is only a fair test for a model trained on that
+     * corpus -- a model trained on something else needs its own
+     * in-distribution prompt passed here, or this test's negative result
+     * measures distribution mismatch, not attribution faithfulness. */
     const char *gen_path = argc > 1 ? argv[1] : "build/model.bin";
-    const char *emb_path = argc > 2 ? argv[2] : "build/embedder.bin";
+    const char *emb_path = (argc > 2 && strcmp(argv[2], "-") != 0) ? argv[2] : NULL;
+    const char *prompt_override = argc > 3 ? argv[3] : NULL;
 
     TCParamSet *gen = tc_paramset_load(gen_path);
-    TCParamSet *emb = tc_paramset_load(emb_path);
-    if (!gen || !emb) { fprintf(stderr, "could not load %s / %s\n", gen_path, emb_path); return 1; }
-    TCConfig cfg = gen->cfg;
-    TCCache *cache = tc_cache_create(cfg);
+    if (!gen) { fprintf(stderr, "could not load %s\n", gen_path); return 1; }
+    TCParamSet *emb = NULL;
+    if (emb_path) {
+        emb = tc_paramset_load(emb_path);
+        if (!emb) { fprintf(stderr, "could not load %s\n", emb_path); return 1; }
+    }
 
-    TCParamSet *gen_random = tc_paramset_create(cfg);
+    TCConfig gen_cfg = gen->cfg;
+    TCCache *cache_gen = tc_cache_create(gen_cfg);
+    TCParamSet *gen_random = tc_paramset_create(gen_cfg);
     tc_paramset_init_random(gen_random, 9999);
-    TCParamSet *emb_random = tc_paramset_create(cfg);
-    tc_paramset_init_random(emb_random, 9999);
 
-    const char *prompt = "the cat sat on the mat quietly, and the dog ran across the log slowly";
+    const char *prompt = prompt_override ? prompt_override
+        : "the cat sat on the mat quietly, and the dog ran across the log slowly";
     int ids[256];
-    int T = encode(prompt, ids, cfg.max_seq_len);
+    int T = encode(prompt, ids, gen_cfg.max_seq_len);
     int T_use = T - 1;
     const int *targets = ids + 1;
     printf("faithcheck prompt: \"%.*s\"\n\n", T, prompt);
+    printf("generative model: %s (d_model=%d, n_layers=%d, %d params)\n",
+           gen_path, gen_cfg.d_model, gen_cfg.n_layers, gen->n_floats);
+    if (emb) printf("embedder model:   %s (d_model=%d, n_layers=%d, %d params)\n",
+                     emb_path, emb->cfg.d_model, emb->cfg.n_layers, emb->n_floats);
+    else printf("embedder model:   none given -- embedder tests skipped\n");
+    printf("\n");
 
     int overall_pass = 1;
 
     /* --- surprise (diagnostic only, expected to fail) --- */
     {
         TCGlassBoxStep steps[256];
-        int n = tc_explain_generate(gen, cache, ids, T, steps);
+        int n = tc_explain_generate(gen, cache_gen, ids, T, steps);
         float imp[256];
         for (int i = 0; i < n; i++) imp[i] = steps[i].surprise;
         int ranked[256];
         argsort_desc(imp, n, ranked);
         LossBaseline bl;
         bl.targets = targets;
-        tc_forward(gen, cache, ids, T_use, targets, &bl.base_loss);
+        tc_forward(gen, cache_gen, ids, T_use, targets, &bl.base_loss);
         printf("== surprise (generative head, known non-attribution) ==\n");
-        run_deletion_curve("surprise", ranked, n, gen, cache, ids, T_use,
+        run_deletion_curve("surprise", ranked, n, gen, cache_gen, ids, T_use,
                             loss_shift, &bl, 12345, 0);
         printf("\n");
     }
@@ -184,21 +206,21 @@ int main(int argc, char **argv) {
     /* --- causal occlusion (generative head, real attribution) --- */
     {
         TCCausalStep steps[256];
-        int n = tc_explain_causal(gen, cache, ids, T, tc_encode_char(' '), steps);
+        int n = tc_explain_causal(gen, cache_gen, ids, T, tc_encode_char(' '), steps);
         float imp[256];
         for (int i = 0; i < n; i++) imp[i] = steps[i].importance;
         int ranked[256];
         argsort_desc(imp, n, ranked);
         LossBaseline bl;
         bl.targets = targets;
-        tc_forward(gen, cache, ids, T_use, targets, &bl.base_loss);
+        tc_forward(gen, cache_gen, ids, T_use, targets, &bl.base_loss);
         printf("== causal occlusion (generative head) ==\n");
-        int pass_del = run_deletion_curve("causal", ranked, n, gen, cache, ids, T_use,
+        int pass_del = run_deletion_curve("causal", ranked, n, gen, cache_gen, ids, T_use,
                                            loss_shift, &bl, 23456, 1);
         overall_pass &= pass_del;
 
         TCCausalStep steps_r[256];
-        tc_explain_causal(gen_random, cache, ids, T, tc_encode_char(' '), steps_r);
+        tc_explain_causal(gen_random, cache_gen, ids, T, tc_encode_char(' '), steps_r);
         float imp_r[256];
         for (int i = 0; i < n; i++) imp_r[i] = steps_r[i].importance;
         float corr = pearson_corr(imp, imp_r, n);
@@ -209,22 +231,29 @@ int main(int argc, char **argv) {
     }
 
     /* --- embedder occlusion (real attribution, per the original design) --- */
-    {
+    if (emb) {
+        TCConfig emb_cfg = emb->cfg;
+        TCCache *cache_emb = tc_cache_create(emb_cfg);
+        TCParamSet *emb_random = tc_paramset_create(emb_cfg);
+        tc_paramset_init_random(emb_random, 9999);
+
+        int T_emb = T < emb_cfg.max_seq_len ? T : emb_cfg.max_seq_len;
+
         TCEmbedOcclusionStep steps[256];
-        int n = tc_explain_embedding(emb, cache, ids, T, steps);
+        int n = tc_explain_embedding(emb, cache_emb, ids, T_emb, steps);
         float imp[256];
         for (int i = 0; i < n; i++) imp[i] = steps[i].importance;
         int ranked[256];
         argsort_desc(imp, n, ranked);
         float base_vec[256];
-        tc_embed(emb, cache, ids, T, base_vec);
+        tc_embed(emb, cache_emb, ids, T_emb, base_vec);
         printf("== embedder occlusion ==\n");
-        int pass_del = run_deletion_curve("embed", ranked, n, emb, cache, ids, T,
+        int pass_del = run_deletion_curve("embed", ranked, n, emb, cache_emb, ids, T_emb,
                                            embed_shift, base_vec, 34567, 1);
         overall_pass &= pass_del;
 
         TCEmbedOcclusionStep steps_r[256];
-        tc_explain_embedding(emb_random, cache, ids, T, steps_r);
+        tc_explain_embedding(emb_random, cache_emb, ids, T_emb, steps_r);
         float imp_r[256];
         for (int i = 0; i < n; i++) imp_r[i] = steps_r[i].importance;
         float corr = pearson_corr(imp, imp_r, n);
@@ -232,16 +261,19 @@ int main(int argc, char **argv) {
         overall_pass &= pass_rand;
         printf("  [embed] randomization check: corr(trained, random) = %.3f  %s\n\n",
                corr, pass_rand ? "PASS" : "FAIL");
+
+        tc_cache_free(cache_emb);
+        tc_paramset_free(emb_random);
     }
 
     printf("=====================================\n");
-    printf(overall_pass ? "FAITHCHECK PASS (embedder + causal occlusion gate; surprise is diagnostic only)\n"
-                         : "FAITHCHECK FAIL\n");
+    printf(overall_pass ? "FAITHCHECK PASS%s\n" : "FAITHCHECK FAIL\n",
+           emb ? " (embedder + causal occlusion gate; surprise is diagnostic only)"
+               : " (causal occlusion gate only, no embedder given; surprise is diagnostic only)");
 
-    tc_cache_free(cache);
+    tc_cache_free(cache_gen);
     tc_paramset_free(gen_random);
-    tc_paramset_free(emb_random);
     tc_paramset_free(gen);
-    tc_paramset_free(emb);
+    if (emb) tc_paramset_free(emb);
     return overall_pass ? 0 : 1;
 }

@@ -18,6 +18,9 @@ $(BUILD)/embed_gradcheck: $(SRC) src/embed_gradcheck.c
 $(BUILD)/train: $(SRC) src/glassbox.c src/train.c
 	$(CC) $(CFLAGS) -o $@ $(SRC) src/glassbox.c src/train.c $(LDLIBS)
 
+$(BUILD)/train_scale: $(SRC) src/glassbox.c src/train_scale.c
+	$(CC) $(CFLAGS) -o $@ $(SRC) src/glassbox.c src/train_scale.c $(LDLIBS)
+
 $(BUILD)/embed_train: $(SRC) src/embed_train.c
 	$(CC) $(CFLAGS) -o $@ $(SRC) src/embed_train.c $(LDLIBS)
 
@@ -46,11 +49,14 @@ gradcheck: $(BUILD)/gradcheck $(BUILD)/embed_gradcheck
 train: $(BUILD)/train
 	./$(BUILD)/train
 
+train_scale: $(BUILD)/train_scale
+	./$(BUILD)/train_scale
+
 embed_train: $(BUILD)/embed_train
 	./$(BUILD)/embed_train
 
 faithcheck: $(BUILD)/faithcheck
-	./$(BUILD)/faithcheck
+	./$(BUILD)/faithcheck build/model.bin build/embedder.bin
 
 known_answer: $(BUILD)/known_answer
 	./$(BUILD)/known_answer
