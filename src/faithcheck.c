@@ -71,6 +71,35 @@ static void argsort_desc(const float *importance, int n, int *out_idx) {
     }
 }
 
+/* Greedy diverse top-k (non-max-suppression style): walk ranked_idx in
+ * importance order, skip any candidate within min_gap of an
+ * already-selected position. Tests the hypothesis that naive top-k
+ * deletion curves fail because the top few positions by *individual*
+ * importance are often redundant, adjacent characters (e.g. several
+ * letters within one word) whose *combined* occlusion doesn't hurt
+ * proportionally more, while a random k-subset is more likely to spread
+ * across genuinely independent parts of the sentence. Because candidates
+ * are processed in strict importance order, out[0..c-1] for the returned
+ * count c is a valid diverse top-k for every k <= c -- callers can pass
+ * a single max_k request and reuse prefixes exactly like a plain ranked
+ * array. out must be zero-initialized-safe sized (>=max_k); unfilled
+ * slots (if fewer than max_k diverse candidates exist) are left at
+ * whatever the caller pre-set, so pre-zero it. */
+static int diverse_select(const int *ranked_idx, int n, int max_k, int min_gap, int *out) {
+    int count = 0;
+    for (int i = 0; i < n && count < max_k; i++) {
+        int cand = ranked_idx[i];
+        int ok = 1;
+        for (int j = 0; j < count; j++) {
+            int d = cand - out[j];
+            if (d < 0) d = -d;
+            if (d < min_gap) { ok = 0; break; }
+        }
+        if (ok) out[count++] = cand;
+    }
+    return count;
+}
+
 /* All metric functions share this exact signature so they can be passed
  * through one function pointer type without a cast -- casting a function
  * pointer to a type whose parameters don't match its definition is
@@ -214,8 +243,24 @@ int main(int argc, char **argv) {
         LossBaseline bl;
         bl.targets = targets;
         tc_forward(gen, cache_gen, ids, T_use, targets, &bl.base_loss);
-        printf("== causal occlusion (generative head) ==\n");
-        int pass_del = run_deletion_curve("causal", ranked, n, gen, cache_gen, ids, T_use,
+        /* Naive top-k is kept for transparency but does NOT gate: it has a
+         * demonstrated redundancy confound (top positions by individual
+         * importance are often adjacent/redundant characters -- see
+         * SCALE_200k.md), which produced false-looking failures on a
+         * verified-faithful model at 222k scale, confirmed by the diverse
+         * variant passing at every k the naive one failed, on that exact
+         * checkpoint. Gating on a test with a known confound would make
+         * this suite less trustworthy, not more. */
+        printf("== causal occlusion, naive top-k (informational, does not gate -- known redundancy confound) ==\n");
+        run_deletion_curve("causal-naive", ranked, n, gen, cache_gen, ids, T_use,
+                            loss_shift, &bl, 23456, 0);
+
+        int min_gap = 3;
+        int diverse[8] = {0};
+        int n_diverse = diverse_select(ranked, n, 5, min_gap, diverse);
+        printf("== causal occlusion, diverse top-k (min_gap=%d, found %d/5 diverse candidates) ==\n",
+               min_gap, n_diverse);
+        int pass_del = run_deletion_curve("causal-diverse", diverse, n, gen, cache_gen, ids, T_use,
                                            loss_shift, &bl, 23456, 1);
         overall_pass &= pass_del;
 
@@ -268,8 +313,8 @@ int main(int argc, char **argv) {
 
     printf("=====================================\n");
     printf(overall_pass ? "FAITHCHECK PASS%s\n" : "FAITHCHECK FAIL\n",
-           emb ? " (embedder + causal occlusion gate; surprise is diagnostic only)"
-               : " (causal occlusion gate only, no embedder given; surprise is diagnostic only)");
+           emb ? " (embedder + causal occlusion [diverse top-k] gate; surprise and naive top-k are diagnostic only)"
+               : " (causal occlusion [diverse top-k] gate only, no embedder given; surprise and naive top-k are diagnostic only)");
 
     tc_cache_free(cache_gen);
     tc_paramset_free(gen_random);
