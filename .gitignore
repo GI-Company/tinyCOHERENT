@@ -1,3 +1,4 @@
 build/
 *.o
 data/tinystories_subset.txt
+.DS_Store
