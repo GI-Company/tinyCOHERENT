@@ -1,10 +1,12 @@
 # Rung 2: scaling to ~222k params on real text
 
-**Status: IN PROGRESS.** Training was still running (53,500 / 100,000
-steps) when this was last updated. The attribution findings below are
-from mid-training checkpoints and are explicitly not final — see "Open
-question" at the end. This file will be updated once training completes
-and the checkpoint is re-tested.
+**Status: COMPLETE.** Training finished all 100,000 steps (2.95 hours).
+**Verdict: real language-modeling ability achieved; NOT a verified
+glass-box model yet.** The generative model learns TinyStories-style text
+correctly, but its causal-occlusion attribution fails its own
+faithfulness gate at multi-position evaluation (k≥2), and this persists
+at full convergence — ruling out "just needs more training." See
+"Resolution" at the end for what's confirmed and what's still open.
 
 ## Goal
 
@@ -62,7 +64,7 @@ sentence boundary as the oracle uses.
    training, 2000 for the final check) and striding evenly across the
    whole val region so the sample stays representative.
 
-## Training progress (snapshot, not final)
+## Training progress (final)
 
 ```
 step      1  train_loss 4.6858  val_loss 4.0540   (chance level: ln(96)=4.56)
@@ -71,13 +73,17 @@ step   1000  train_loss 1.3751  val_loss 1.2747
 ...
 step  28500  train_loss 0.7395  val_loss 0.9168
 ...
-step  53500  train_loss 0.7417  val_loss 0.8924
+step  52000  train_loss 0.8557  val_loss 0.8908
+...
+step 100000  (final)             val_loss 0.8831 over the full 599,865-byte held-out set
+trained 100000 steps x batch 8 on 100-token chunks in 10616.37s (2.95 hours)
 ```
 
-Loss dropped from chance level to ~0.86-0.89 and continues to decline
-slowly; val loss tracks train loss closely throughout with no widening
-gap — no overfitting signal so far. Rate holds at ~90-95ms/step
-(~2.5-2.7 hours total estimated for the full 100k steps).
+Loss dropped from chance level to ~0.88 and effectively plateaued by
+around step 50,000 — the last 48,000 steps (roughly half the run) moved
+val loss by less than 0.01. Val loss tracked train loss closely
+throughout with no widening gap — no overfitting signal at any point.
+Rate held at ~90-95ms/step.
 
 A mid-run generation sample at step 15,000 (from a genuinely held-out
 prompt): given `" Then they went to the bathroom to wash "`, continued
@@ -100,58 +106,63 @@ oracle + its embedder, byte-for-byte identical results to before the
 refactor (same correlations, same deletion-curve numbers) — the fix
 changed nothing about the case that already worked.
 
-**The finding.** `faithcheck` run against `model_scale.bin` currently
-reports `FAITHCHECK FAIL`, at two checkpoints tested so far:
+**The finding.** `faithcheck` run against `model_scale.bin` reports
+`FAITHCHECK FAIL` at all three checkpoints tested, including the final,
+fully-converged one:
 
-| k | causal occlusion @ 28.5% trained | @ 52% trained |
-|---|---|---|
-| 1 | ok | ok |
-| 2 | INVERTED | INVERTED |
-| 3 | INVERTED | ok |
-| 5 | INVERTED | INVERTED |
+| k | @ 28.5% trained | @ 52% trained | **@ 100% (final)** |
+|---|---|---|---|
+| 1 | ok | ok | **ok** |
+| 2 | INVERTED | INVERTED | **INVERTED** |
+| 3 | INVERTED | ok | **ok** |
+| 5 | INVERTED | INVERTED | **INVERTED** |
 
-Randomization check passes cleanly at both checkpoints (corr = -0.166,
--0.123 — well inside the ±0.5 threshold), so the attribution is reading
-something real from the trained weights, not producing noise
+Randomization check passes cleanly at every checkpoint (corr = -0.166,
+-0.123, **-0.077** — well inside the ±0.5 threshold and, if anything,
+getting cleaner with more training), so the attribution is reading
+something real from the trained weights throughout, not producing noise
 indistinguishable from an untrained model. The failure is specifically
-in the deletion curve at k≥2: occluding the top-k "important" positions
-together does not consistently hurt more than occluding k random
-positions.
+in the deletion curve at k=2 and k=5: occluding the top-k "important"
+positions together does not consistently hurt more than occluding k
+random positions.
 
 Ruled out: this is not the out-of-distribution-baseline problem from the
-known-answer investigation. The same failure pattern held on a prompt
-drawn from the model's own held-out TinyStories val split, not just the
-oracle's hardcoded template-corpus prompt.
+known-answer investigation (same failure on a genuinely held-out
+TinyStories prompt, not just a template-corpus prompt). It is also now
+**not the undertrained-model hypothesis**: val loss had already
+plateaued by the 52% checkpoint (0.8908 there vs. 0.8831 at the true
+final step — the last 48,000 steps moved it by less than 0.01), and the
+k=2/k=5 failures persisted unchanged regardless.
 
-**Two live hypotheses, neither confirmed:**
-1. **Undertrained model.** Loss is still declining; a half-converged
-   model's causal structure may not be consolidated enough yet for
-   multi-position occlusion to rank cleanly, even though single-position
-   (k=1) ranking already works and randomization already passes.
-2. **Greedy top-k redundancy.** A known, general limitation of
-   deletion-curve tests: selecting the top-k positions by *individual*
-   importance can pick several redundant, adjacent characters (e.g.
-   within one word) whose *combined* occlusion doesn't hurt proportionally
-   more, while a random k-subset is more likely to hit independent parts
-   of the sentence. Plausibly more pronounced on real, information-dense
-   text than on the oracle's short repetitive templates.
+## Resolution
 
-The k=3 flip from INVERTED to ok between the two checkpoints is a mild
-signal toward hypothesis 1, but one flipped data point is not a trend --
-this session's degradation sweep already showed how much single-checkpoint
-deletion-curve numbers can move from noise alone.
+**Confirmed:** real language-modeling ability was achieved at this scale
+(loss dropped from chance level to 0.88, the model correctly reproduces
+TinyStories' story-restart convention, no overfitting at any point).
+**Confirmed:** causal-occlusion attribution is reading real, trained
+structure (randomization check passes cleanly at every checkpoint, and
+single-position (k=1) ranking works throughout).
+**Confirmed ruled out:** the multi-position deletion-curve failure is not
+an artifact of an out-of-distribution test prompt, and not a symptom of
+undertraining — more training (52%→100%, essentially flat val loss)
+did not change the outcome.
 
-## Open question
+**Standing hypothesis, not yet confirmed:** greedy top-k redundancy in
+the deletion-curve test itself. Selecting the top-k positions by
+*individual* importance can pick several redundant, adjacent characters
+(e.g. multiple letters within one word) whose *combined* occlusion
+doesn't hurt proportionally more than occluding just one of them, while a
+random k-subset is more likely to land on genuinely independent parts of
+the sentence. This is a known, general limitation of naive top-k deletion
+curves in the broader attribution literature, not specific to a bug in
+this codebase -- but it hasn't been directly demonstrated here yet.
 
-Does `faithcheck` pass once training actually completes? That's the
-test that distinguishes the two hypotheses above: a clean pass at
-convergence supports "just needed more training"; a persistent failure
-at convergence means the deletion-curve methodology itself needs
-rethinking for real text, not more training steps. Re-run:
-
-```
-./build/faithcheck build/model_scale.bin - "<a fresh held-out TinyStories prompt>"
-```
-
-against the final checkpoint and update this document with the result
-before treating rung 2 as either a pass or a fail.
+**What would actually confirm or refute it:** a deletion-curve variant
+that selects a *diverse* top-k (e.g. greedily excluding candidates whose
+position is within a few characters of one already selected) instead of
+a naive top-k, re-run against this same checkpoint and prompt. If that
+passes where the naive version fails, the redundancy hypothesis is
+confirmed and the fix belongs in the test methodology, not the
+attribution mechanism. That work is not done yet -- **rung 2 should be
+treated as "real language modeling, glass-box status unresolved" until
+it is.**
