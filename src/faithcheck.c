@@ -140,13 +140,16 @@ static float embed_shift(const TCParamSet *p, TCCache *c, const int *ids, int T,
     return 1.0f - tc_cosine(base_vec, vec, D);
 }
 
+static int csv_mode = 0;
+
 static int run_deletion_curve(const char *name, const int *ranked_idx, int n_positions,
                                const TCParamSet *p, TCCache *c, const int *ids, int T,
-                               MetricFn metric, const void *baseline, unsigned int seed, int gates) {
+                               MetricFn metric, const void *baseline, unsigned int seed, int gates,
+                               float *out_effects) {
     int ks[] = { 1, 2, 3, 5 };
     int n_ks = 4;
     int all_pass = 1;
-    printf("  [%s] deletion curve%s:\n", name, gates ? "" : " (diagnostic only, does not gate)");
+    if (!csv_mode) printf("  [%s] deletion curve%s:\n", name, gates ? "" : " (diagnostic only, does not gate)");
     unsigned int rng = seed;
     for (int ki = 0; ki < n_ks; ki++) {
         int k = ks[ki];
@@ -163,29 +166,34 @@ static int run_deletion_curve(const char *name, const int *ranked_idx, int n_pos
         float rand_effect = rand_total / trials;
         int pass = top_effect > rand_effect;
         if (!pass) all_pass = 0;
-        printf("    k=%d  top=%.4f  random_avg=%.4f  %s\n", k, top_effect, rand_effect,
+        if (out_effects) out_effects[ki] = top_effect;
+        if (!csv_mode) printf("    k=%d  top=%.4f  random_avg=%.4f  %s\n", k, top_effect, rand_effect,
                pass ? "ok" : "INVERTED");
     }
-    printf("  [%s] deletion curve: %s\n", name, all_pass ? "PASS" : "FAIL");
+    if (!csv_mode) printf("  [%s] deletion curve: %s\n", name, all_pass ? "PASS" : "FAIL");
     return all_pass;
 }
 
 int main(int argc, char **argv) {
-    /* Embedder is optional and, critically, gets its OWN cache sized to
-     * its OWN config -- gen and emb can be different scales (e.g. testing
-     * a freshly-scaled generative checkpoint before a matching embedder
-     * exists), and sharing one cache sized to gen's config while running
-     * emb's forward pass through it is a real memory-safety bug the
-     * moment the two configs diverge, not just a style issue. */
-    /* argv[2] "-" means "no embedder" explicitly, so argv[3] (prompt
-     * override) can be reached positionally. A hardcoded prompt drawn
-     * from one corpus is only a fair test for a model trained on that
-     * corpus -- a model trained on something else needs its own
-     * in-distribution prompt passed here, or this test's negative result
-     * measures distribution mismatch, not attribution faithfulness. */
-    const char *gen_path = argc > 1 ? argv[1] : "build/model.bin";
-    const char *emb_path = (argc > 2 && strcmp(argv[2], "-") != 0) ? argv[2] : NULL;
-    const char *prompt_override = argc > 3 ? argv[3] : NULL;
+    const char *gen_path = "build/model.bin";
+    const char *emb_path = NULL;
+    const char *prompt_override = NULL;
+    int pos_args = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--csv") == 0) {
+            csv_mode = 1;
+        } else if (pos_args == 0) {
+            gen_path = argv[i];
+            pos_args++;
+        } else if (pos_args == 1) {
+            emb_path = (strcmp(argv[i], "-") != 0) ? argv[i] : NULL;
+            pos_args++;
+        } else if (pos_args == 2) {
+            prompt_override = argv[i];
+            pos_args++;
+        }
+    }
 
     TCParamSet *gen = tc_paramset_load(gen_path);
     if (!gen) { fprintf(stderr, "could not load %s\n", gen_path); return 1; }
@@ -208,7 +216,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "could not load BPE merges from %s\n", bpe_path);
             return 1;
         }
-        printf("bpe tokenizer:    %s (vocab=%d, %d merges)\n", bpe_path, bpe->vocab_size, bpe->num_merges);
+        if (!csv_mode) printf("bpe tokenizer:    %s (vocab=%d, %d merges)\n", bpe_path, bpe->vocab_size, bpe->num_merges);
     }
 
     const char *prompt = prompt_override ? prompt_override
@@ -222,16 +230,21 @@ int main(int argc, char **argv) {
     }
     int T_use = T - 1;
     const int *targets = ids + 1;
-    printf("faithcheck prompt: \"%s\" (tokens=%d)\n\n", prompt, T);
-    printf("generative model: %s (d_model=%d, n_layers=%d, %d params)\n",
-           gen_path, gen_cfg.d_model, gen_cfg.n_layers, gen->n_floats);
-    if (emb) printf("embedder model:   %s (d_model=%d, n_layers=%d, %d params)\n",
-                     emb_path, emb->cfg.d_model, emb->cfg.n_layers, emb->n_floats);
-    else printf("embedder model:   none given -- embedder tests skipped\n");
-    printf("\n");
+    if (!csv_mode) {
+        printf("faithcheck prompt: \"%s\" (tokens=%d)\n\n", prompt, T);
+        printf("generative model: %s (d_model=%d, n_layers=%d, %d params)\n",
+               gen_path, gen_cfg.d_model, gen_cfg.n_layers, gen->n_floats);
+        if (emb) printf("embedder model:   %s (d_model=%d, n_layers=%d, %d params)\n",
+                         emb_path, emb->cfg.d_model, emb->cfg.n_layers, emb->n_floats);
+        else printf("embedder model:   none given -- embedder tests skipped\n");
+        printf("\n");
+    }
 
     int overall_pass = 1;
     int mask_token = (gen_cfg.vocab_size > 256) ? 32 : tc_encode_char(' ');
+
+    float csv_del_k[4] = {0};
+    float csv_rand_corr = 0.0f;
 
     /* --- surprise (diagnostic only, expected to fail) --- */
     {
@@ -244,10 +257,10 @@ int main(int argc, char **argv) {
         LossBaseline bl;
         bl.targets = targets;
         tc_forward(gen, cache_gen, ids, T_use, targets, &bl.base_loss);
-        printf("== surprise (generative head, known non-attribution) ==\n");
+        if (!csv_mode) printf("== surprise (generative head, known non-attribution) ==\n");
         run_deletion_curve("surprise", ranked, n, gen, cache_gen, ids, T_use,
-                            loss_shift, &bl, 12345, 0);
-        printf("\n");
+                            loss_shift, &bl, 12345, 0, NULL);
+        if (!csv_mode) printf("\n");
     }
 
     /* --- causal occlusion (generative head, real attribution) --- */
@@ -269,17 +282,17 @@ int main(int argc, char **argv) {
          * variant passing at every k the naive one failed, on that exact
          * checkpoint. Gating on a test with a known confound would make
          * this suite less trustworthy, not more. */
-        printf("== causal occlusion, naive top-k (informational, does not gate -- known redundancy confound) ==\n");
+        if (!csv_mode) printf("== causal occlusion, naive top-k (informational, does not gate -- known redundancy confound) ==\n");
         run_deletion_curve("causal-naive", ranked, n, gen, cache_gen, ids, T_use,
-                            loss_shift, &bl, 23456, 0);
+                            loss_shift, &bl, 23456, 0, NULL);
 
         int min_gap = (bpe != NULL) ? 2 : 3;
         int diverse[8] = {0};
         int n_diverse = diverse_select(ranked, n, 5, min_gap, diverse);
-        printf("== causal occlusion, diverse top-k (min_gap=%d, found %d/5 diverse candidates) ==\n",
+        if (!csv_mode) printf("== causal occlusion, diverse top-k (min_gap=%d, found %d/5 diverse candidates) ==\n",
                min_gap, n_diverse);
         int pass_del = run_deletion_curve("causal-diverse", diverse, n, gen, cache_gen, ids, T_use,
-                                           loss_shift, &bl, 23456, 1);
+                                           loss_shift, &bl, 23456, 1, csv_del_k);
         overall_pass &= pass_del;
 
         TCCausalStep steps_r[256];
@@ -287,9 +300,10 @@ int main(int argc, char **argv) {
         float imp_r[256];
         for (int i = 0; i < n; i++) imp_r[i] = steps_r[i].importance;
         float corr = pearson_corr(imp, imp_r, n);
+        csv_rand_corr = corr;
         int pass_rand = fabsf(corr) < 0.5f;
         overall_pass &= pass_rand;
-        printf("  [causal] randomization check: corr(trained, random) = %.3f  %s\n\n",
+        if (!csv_mode) printf("  [causal] randomization check: corr(trained, random) = %.3f  %s\n\n",
                corr, pass_rand ? "PASS" : "FAIL");
     }
 
@@ -308,10 +322,10 @@ int main(int argc, char **argv) {
         int min_gap = 3;
         int diverse[8] = {0};
         int n_diverse = diverse_select(ranked, n, 5, min_gap, diverse);
-        printf("== input gradient attribution, diverse top-k (min_gap=%d, found %d/5 diverse candidates) ==\n",
+        if (!csv_mode) printf("== input gradient attribution, diverse top-k (min_gap=%d, found %d/5 diverse candidates) ==\n",
                min_gap, n_diverse);
         run_deletion_curve("grad-diverse", diverse, n, gen, cache_gen, ids, T_use,
-                           loss_shift, &bl, 23456, 0);
+                           loss_shift, &bl, 23456, 0, NULL);
 
         TCGradStep steps_r[256];
         tc_explain_input_grad(gen_random, cache_gen, ids, T, steps_r);
@@ -319,7 +333,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n; i++) imp_r[i] = steps_r[i].importance;
         float corr = pearson_corr(imp, imp_r, n);
         int pass_rand = fabsf(corr) < 0.5f;
-        printf("  [grad] randomization check: corr(trained, random) = %.3f  %s\n\n",
+        if (!csv_mode) printf("  [grad] randomization check: corr(trained, random) = %.3f  %s\n\n",
                corr, pass_rand ? "PASS" : "FAIL");
     }
 
@@ -340,9 +354,9 @@ int main(int argc, char **argv) {
         argsort_desc(imp, n, ranked);
         float base_vec[TC_MAX_D_MODEL];
         tc_embed(emb, cache_emb, ids, T_emb, base_vec);
-        printf("== embedder occlusion ==\n");
+        if (!csv_mode) printf("== embedder occlusion ==\n");
         int pass_del = run_deletion_curve("embed", ranked, n, emb, cache_emb, ids, T_emb,
-                                           embed_shift, base_vec, 34567, 1);
+                                           embed_shift, base_vec, 34567, 1, NULL);
         overall_pass &= pass_del;
 
         TCEmbedOcclusionStep steps_r[256];
@@ -352,17 +366,23 @@ int main(int argc, char **argv) {
         float corr = pearson_corr(imp, imp_r, n);
         int pass_rand = fabsf(corr) < 0.5f;
         overall_pass &= pass_rand;
-        printf("  [embed] randomization check: corr(trained, random) = %.3f  %s\n\n",
+        if (!csv_mode) printf("  [embed] randomization check: corr(trained, random) = %.3f  %s\n\n",
                corr, pass_rand ? "PASS" : "FAIL");
 
         tc_cache_free(cache_emb);
         tc_paramset_free(emb_random);
     }
 
-    printf("=====================================\n");
-    printf(overall_pass ? "FAITHCHECK PASS%s\n" : "FAITHCHECK FAIL\n",
-           emb ? " (embedder + causal occlusion [diverse top-k] gate; surprise and naive top-k are diagnostic only)"
-               : " (causal occlusion [diverse top-k] gate only, no embedder given; surprise and naive top-k are diagnostic only)");
+    if (!csv_mode) {
+        printf("=====================================\n");
+        printf(overall_pass ? "FAITHCHECK PASS%s\n" : "FAITHCHECK FAIL\n",
+               emb ? " (embedder + causal occlusion [diverse top-k] gate; surprise and naive top-k are diagnostic only)"
+                   : " (causal occlusion [diverse top-k] gate only, no embedder given; surprise and naive top-k are diagnostic only)");
+    } else {
+        float avg_del = (csv_del_k[0] + csv_del_k[1] + csv_del_k[2] + csv_del_k[3]) / 4.0f;
+        printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+               csv_del_k[0], csv_del_k[1], csv_del_k[2], csv_del_k[3], avg_del, csv_rand_corr);
+    }
 
     tc_cache_free(cache_gen);
     tc_paramset_free(gen_random);

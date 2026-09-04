@@ -1,130 +1,107 @@
-# Rung 6: 21.5M Parameter Architecture, BLAS Acceleration & Scaled Glass-Box Faithfulness
+# Rung 6 Systems Milestone: 21.5M Parameter Architecture, BLAS Acceleration & 900-Step Empirical Analysis
 
 ## 1. Executive Summary
 
-Rung 6 scales the pure C TinyCoherent (GLASSBOX) architecture to **21,534,208 parameters (~21.53M)**, a 5.5x expansion over Rung 4, while preserving complete mathematical interpretability, zero external deep learning framework dependencies, and deterministic bit-level inspectability:
-- **Architecture Configuration**: $D = 512, L = 6, H = 8, V = 2048, \text{ff\_mult} = 2, T = 128$.
-- **SIMD BLAS Hardware Acceleration**: Integrated Apple Accelerate framework `cblas_sgemv` and `cblas_sger` matrix kernels for forward and backward passes, delivering vectorized throughput on Apple Silicon.
-- **Dynamic Stack Bounding**: Core engine buffers expanded from $D \le 256, FF \le 1024$ to $D \le 1024, FF \le 4096$, maintaining zero heap allocations during token evaluation and training hot loops.
-- **Multi-Core Parallel Batch Training**: Scaled Grand Central Dispatch (`dispatch_apply`) parallel batch execution across 8 worker cores.
-- **Verified Interpretability & Faithfulness**: Passed analytical gradient checks (`make gradcheck`), known-answer mechanistic attribution (`make known_answer`), causal occlusion deletion curves (`make faithcheck_rung6`), and latent activation steering identity (`make test_steer`).
+> **Current Status**: 900-step Rung 6 checkpoint, val ~2.08 (standardized held-out loss: 2.1637), faithcheck still pass, generation not yet coherent.
+
+Rung 6 represents a pure systems milestone for TinyCoherent (GLASSBOX):
+- **Systems Demonstration**: A 21,534,208 parameter hybrid recurrent-attention model ($D=512, L=6, H=8, V=2048, \text{ff\_mult}=2, T=128$) running entirely in pure C with zero third-party ML framework dependencies.
+- **Hardware Acceleration**: Replaced scalar C loops in `matvec` and `matvec_backward` with native Apple Accelerate SIMD BLAS calls (`cblas_sgemv`, `cblas_sger`), yielding a sustained throughput of **~400 tokens/second** during 8-worker parallel training on Apple Silicon.
+- **Attribution Gate Stability**: Causal occlusion deletion curves survived loss reduction from the high-7s down into the low-2s without collapsing ($1.95\times$ impact vs random baseline).
+- **Linguistic Reality**: Total training exposure across 900 steps is **720,000 tokens**—still an early warmup. The model exhibits broken syntax and mode-collapsing completions; it is **not** a fluent language model and is **not** ready for production export (GGUF deferred).
 
 ---
 
-## 2. Parameter Layout & Architecture Scaling
+## 2. Checkpoint Provenance & Frozen Artifact
 
-### Parameter Count Derivation ($V=2048, D=512, L=6, \text{ff\_mult}=2$)
+To ensure exact reproducibility and prevent silent overwrites, the 900-step checkpoint has been frozen:
 
-| Component | Dimensions | Parameters per Unit | Units | Total Parameters | FP32 Size |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Token Embeddings** | $V \times D$ (tied with unembed) | $2048 \times 512$ | 1 | 1,048,576 | 4.19 MB |
-| **Final LayerNorm** | $\gamma, \beta$ | $2 \times 512$ | 1 | 1,024 | 4.1 KB |
-| **Embedder Query** | $\mathbf{w}_{\text{pool}}$ | 512 | 1 | 512 | 2.0 KB |
-| **LayerNorm 1** | $\gamma, \beta$ | $2 \times 512$ | 6 | 6,144 | 24.6 KB |
-| **Time-Mix (Tokens)** | $\mathbf{m}_k, \mathbf{m}_v, \mathbf{m}_r, \boldsymbol{\lambda}_{\text{decay}}$ | $4 \times 512$ | 6 | 12,288 | 49.2 KB |
-| **Time-Mix Projections** | $W_k, W_v, W_r, W_o$ | $4 \times (512 \times 512)$ | 6 | 6,291,456 | 25.17 MB |
-| **LayerNorm 2** | $\gamma, \beta$ | $2 \times 512$ | 6 | 6,144 | 24.6 KB |
-| **Self-Attention** | $W_q, W_k, W_v, W_o$ | $4 \times (512 \times 512)$ | 6 | 6,291,456 | 25.17 MB |
-| **LayerNorm 3** | $\gamma, \beta$ | $2 \times 512$ | 6 | 6,144 | 24.6 KB |
-| **Channel-Mix (FFN)** | $\mathbf{m}_k, \mathbf{m}_r$ | $2 \times 512$ | 6 | 6,144 | 24.6 KB |
-| **Channel-Mix Projections** | $W_k (512 \times 1024), W_v (1024 \times 512), W_r (512 \times 512)$ | $524288 + 524288 + 262144$ | 6 | 7,864,320 | 31.46 MB |
-| **Total Model** | -- | -- | -- | **21,534,208** | **86.14 MB** |
-
-The parameter count is allocated in a single flat contiguous buffer (`ps->buf`), allowing instant zero-copy serialization and uniform Adam optimization.
+- **File Path**: `build/model_rung6_step900.bin`
+- **SHA-256 Hash**: `ce50612d4ab4c431673478fd844f625319f2490fbeac6c3fad94ba0db59f6ce1`
+- **Parameter Count**: 21,534,208 FP32 floats (86.14 MB)
+- **Configuration**: $V=2048, D=512, L=6, H=8, \text{ff\_mult}=2, T_{\text{max}}=128$
 
 ---
 
-## 3. Hardware Acceleration via BLAS
+## 3. Standardized Validation Benchmark Protocol
 
-At $D=512$, matrix operations dominate execution time ($512 \times 512 = 262,144$ FLOPs per projection; $1024 \times 512 = 524,288$ FLOPs per FFN step). 
+### The Need for Protocol Standardization
+Earlier intermediate logging sampled varying chunk counts ($N=25$ vs $N=50$ vs $N=100$), which altered sampling stride across the validation split and introduced artificial variance (e.g. 3.51 vs 2.61). 
 
-To achieve high interactive and training performance without external dependencies, TinyCoherent routes matrix operations through Apple's native Accelerate framework:
+### Standardized Benchmark Definition
+All evaluation is now locked to a single deterministic recipe implemented in `src/train_scale.c`:
+- **Slice**: Exactly the held-out 15% split of `data/tinystories_subset.txt` (278,872 tokens).
+- **Chunk Length**: 100 tokens.
+- **Sample Count**: Exactly **100 fixed chunks (10,000 held-out tokens)** evaluated at deterministic strides.
 
-```c
-/* Forward matrix-vector multiplication: y = W x */
-static void matvec(const float *W, const float *x, float *y, int out, int in) {
-#if defined(__APPLE__) && defined(ACCELERATE_NEW_LAPACK)
-    cblas_sgemv(CblasRowMajor, CblasNoTrans, out, in, 1.0f, W, in, x, 1, 0.0f, y, 1);
-#else
-    for (int o = 0; o < out; o++) {
-        float s = 0.0f;
-        const float *row = W + (size_t)o * in;
-        for (int i = 0; i < in; i++) s += row[i] * x[i];
-        y[o] = s;
-    }
-#endif
-}
-
-/* Backward matrix-vector accumulation: dW += dy * x^T, dx += W^T * dy */
-static void matvec_backward(const float *W, float *dW, const float *x, float *dx,
-                             const float *dy, int out, int in) {
-#if defined(__APPLE__) && defined(ACCELERATE_NEW_LAPACK)
-    if (dW) cblas_sger(CblasRowMajor, out, in, 1.0f, dy, 1, x, 1, dW, in);
-    if (dx) cblas_sgemv(CblasRowMajor, CblasTrans, out, in, 1.0f, W, in, dy, 1, 1.0f, dx, 1);
-#else
-    /* Scalar C fallback loops */
-    ...
-#endif
-}
-```
-
-### Mathematical Invariance
-Because BLAS matrix operations adhere to IEEE-754 floating-point standards:
-- `make gradcheck` passes with zero tolerance violations ($\text{worst margin} = -0.001793 < 0$).
-- Analytical gradient derivations are bit-accurate across both forward and backward passes.
+Under this locked benchmark protocol:
+- **`model_rung6_step900.bin` Exact Held-Out Loss**: **2.1637**
 
 ---
 
-## 4. Multi-Rung Comparative Scaling Analysis
+## 4. Official Qualitative Evaluation: Before vs. After
 
-| Metric | Rung 1 (Oracle) | Rung 2 | Rung 3 | Rung 4 (BPE Base) | Rung 6 (Scaled) |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Vocabulary ($V$)** | 96 chars | 96 chars | 96 chars | 2048 BPE | **2048 BPE** |
-| **Dimension ($D$)** | 64 | 128 | 256 | 256 | **512** |
-| **Layers ($L$)** | 1 | 2 | 4 | 4 | **6** |
-| **Heads ($H$)** | 2 | 4 | 4 | 8 | **8** |
-| **Parameters** | 8,448 | 222,080 | 3,445,504 | 3,945,216 | **21,534,208** |
-| **File Size (FP32)** | 33.8 KB | 888 KB | 13.8 MB | 15.8 MB | **86.1 MB** |
-| **Training Engine** | Single-core C | Single-core C | Multi-core C | GCD Parallel | **GCD + Accelerate BLAS** |
-| **Effective Context**| ~20 words | ~20 words | ~20 words | ~60–80 words | **~60–80 words** |
+To prevent cherry-picking, evaluation is locked to **two official benchmark prompts** decoded deterministically at **Greedy ($T=0$)**, temperature 0, fixed seed:
 
----
+### Benchmark Pair 1
+- **Prompt**: `"Timmy found a shiny red ball in the garden."`
+- **Step 300 Output**:
+  > `"Timmy found a shiny red ball in the garden. I a little bird to the bird had very happy to the ground away the dog the "`
+- **Step 900 Output (Greedy $T=0$)**:
+  > `"Timmy found a shiny red ball in the garden. The bird was very happy and said, "I will help you like the park. The bird was very "`
 
-## 5. Interpretability & Faithfulness Verification
+### Benchmark Pair 2
+- **Prompt**: `"The puppy was very hungry, so he"`
+- **Step 300 Output**:
+  > `"The puppy was very hungry, so he a big happy and the  the  named there was a big tree home the bird the "`
+- **Step 900 Output (Greedy $T=0$)**:
+  > `"The puppy was very hungry, so he was very happy. The bird was very happy and said, "I will help you like the park. The"`
 
-A scaled model in GLASSBOX must satisfy all interpretability constraints before deployment:
-
-1. **Analytical Input Gradients (`tc_input_grad`)**:
-   Computes exact $\nabla_{\mathbf{x}_0} \mathcal{L}$ in a single backward pass without allocating parameter memory.
-2. **Causal Occlusion Deletion Curves (`faithcheck_rung6`)**:
-   Verifies that occluding tokens deemed important by causal interventions degrades model confidence monotonically faster than random baseline occlusions.
-3. **Activation Steering Linearity (`test_steer`)**:
-   Verifies exact identity at $\alpha = 0.00000000$ and monotonic log-probability modulation when injecting concept vectors at intermediate residual layers.
+### Empirical Diagnostic
+1. **Progress**: The model reduced exact repetitive unigram stuttering (*"to the bird had very happy to the ground away the dog the"* $\to$ grammatical phrases).
+2. **Failure Mode**: Both prompts collapse greedily into the identical high-frequency memorized n-gram pattern (*"The bird was very happy and said, 'I will help you like the park. The..."*). 
+3. **Verdict**: The model has acquired local subword bigram/trigram transition probabilities but possesses **zero plot maintenance or multi-sentence narrative grounding**.
 
 ---
 
-## 6. How to Run Rung 6
+## 5. Mechanistic Faithfulness & Attribution Stability
 
-### Training
-Train the 21.5M model from scratch on the BPE tokenized TinyStories dataset:
-```bash
-make train_rung6
-```
+A central research question in glass-box scaling is whether mechanistic interpretability collapses as loss drops:
 
-### Faithfulness Verification
-Run the automated deletion curve and randomization battery:
-```bash
-make faithcheck_rung6
-```
+| Checkpoint | Training Exposure | Held-Out Val Loss | Causal Deletion Ratio ($k=1..5$) | Random Weight Correlation | Steering Identity ($\alpha=0$) |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **Rung 4 (3.9M)** | ~1.5M tokens | ~1.85 | $1.85\times$ avg impact | $\text{corr} = -0.077$ (PASS) | Bit-identical |
+| **Rung 6 (300 step)** | 240k tokens | ~2.60 | $2.04\times$ avg impact | $\text{corr} = +0.164$ (PASS) | Bit-identical |
+| **Rung 6 (900 step)** | 720k tokens | **2.1637** | **$1.95\times$ avg impact** | $\text{corr} = +0.160$ (PASS) | Bit-identical |
 
-### Activation Steering Tests
-Verify latent concept injection on the scaled model:
-```bash
-./build/test_steer build/model_rung6.bin data/bpe_merges.txt
-```
+### Analysis
+- **Attribution Stability**: Attribution did not immediately degrade as loss moved from 7.7 down to 2.16. The deletion ratio shifted slightly ($2.04\times \to 1.95\times$), which represents normal single-run sample variation rather than an attribution breakdown.
+- **Latent Steering Invariance**: $\alpha = 0.0$ residual injection remains mathematically identical to unsteered baseline inference ($\max |\Delta z| = 0.00000000$).
 
-### Interactive Glass-Box Chat
-Run terminal chat with real-time surprise telemetry, `/explain`, and `/steer`:
-```bash
-make chat_rung6
-```
+---
+
+## 6. Systems Scaling & Architecture Specifications
+
+| Parameter | Specification |
+| :--- | :--- |
+| **Hidden Dimension ($D$)** | 512 |
+| **Number of Layers ($L$)** | 6 |
+| **Attention Heads ($H$)** | 8 (head dimension $D_h = 64$) |
+| **FFN Expansion Ratio** | 2 ($FF = 1024$) |
+| **Vocabulary Size ($V$)** | 2,048 byte-level BPE subwords |
+| **Context Horizon ($T$)** | 128 tokens |
+| **Total Parameters** | **21,534,208** (86.14 MB FP32) |
+| **Linear Algebra Engine** | Apple Accelerate BLAS (`cblas_sgemv`, `cblas_sger`) |
+| **Parallel Execution** | Grand Central Dispatch (`dispatch_apply`), 8 worker cores |
+| **Observed Throughput** | **~396–410 tokens/second** |
+
+---
+
+## 7. Next Research Directions (GGUF Deferred)
+
+Exporting to GGUF format for `llama.cpp` is explicitly deferred. Deploying an undertrained 21.5M checkpoint alongside fluent production LLMs does not advance the project's scientific value.
+
+### Priority Research Agenda:
+1. **Extended Token Scaling**: Train across tens of millions of tokens using the standardized evaluation recipe.
+2. **The Faithfulness vs. Fluency Curve**: Periodically evaluate `faithcheck` deletion ratios across training checkpoints to plot **validation loss vs. causal deletion ratio**. The primary scientific inquiry is: *Does mechanistic glass-box attribution remain faithful as the language model transitions from topic soup to true narrative fluency?*
+3. **Planted-Fact Grounding**: Implement verified retrieval benchmarks before attempting model distribution.

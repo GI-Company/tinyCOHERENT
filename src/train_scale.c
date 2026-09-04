@@ -40,25 +40,25 @@ static void scale_grad(TCParamSet *grad, float s) {
     for (int i = 0; i < grad->n_floats; i++) grad->buf[i] *= s;
 }
 
+/* Standardized validation benchmark protocol: evaluates exactly 100 chunks
+ * (10,000 held-out tokens) at fixed deterministic offsets every time,
+ * eliminating sampling variance between intermediate reports and final checkpoints. */
 static float eval_val_loss(const TCParamSet *p, TCCache *cache, const int *val_tokens, long val_len,
-                            int chunk_len, int max_chunks) {
-    long total_possible = (val_len - 1) / chunk_len;
-    if (total_possible < 1) return -1.0f;
-    long n_chunks = total_possible < max_chunks ? total_possible : max_chunks;
-    long stride = total_possible / n_chunks;
+                            int chunk_len) {
+    int fixed_chunks = 100;
+    long stride = (val_len - 1) / (chunk_len * fixed_chunks);
     if (stride < 1) stride = 1;
-
     float total = 0.0f;
-    long used = 0;
-    for (long i = 0; i < n_chunks; i++) {
-        long off = i * stride * chunk_len;
+    int used = 0;
+    for (int i = 0; i < fixed_chunks; i++) {
+        long off = (long)i * stride * chunk_len;
         if (off + chunk_len >= val_len) break;
         float loss;
         tc_forward(p, cache, val_tokens + off, chunk_len, val_tokens + off + 1, &loss);
         total += loss;
         used++;
     }
-    return used > 0 ? total / used : -1.0f;
+    return used > 0 ? (total / (float)used) : -1.0f;
 }
 
 int main(int argc, char **argv) {
@@ -267,7 +267,7 @@ int main(int argc, char **argv) {
         running_loss = (step == 1) ? step_loss : 0.98f * running_loss + 0.02f * step_loss;
 
         if (step % report_every == 0 || step == 1) {
-            float val_loss = eval_val_loss(p, caches[0], val_tokens, val_len, chunk_len, 25);
+            float val_loss = eval_val_loss(p, caches[0], val_tokens, val_len, chunk_len);
             double secs = get_time_sec() - t0;
             double tok_per_sec = (double)(step * batch_size * chunk_len) / (secs > 0 ? secs : 1.0);
             printf("step %6d  lr %.6f  train_loss %.4f (avg %.4f)  val_loss %.4f  [%.1fs | %.0f tok/s]\n",
@@ -283,8 +283,8 @@ int main(int argc, char **argv) {
     printf("trained %d steps x batch %d on %d-token chunks in %.2fs (%.0f tokens/sec)\n",
            num_steps, batch_size, chunk_len, secs, (double)(num_steps * batch_size * chunk_len) / secs);
 
-    float final_val_loss = eval_val_loss(p, caches[0], val_tokens, val_len, chunk_len, 50);
-    printf("final val_loss %.4f over %ld held-out tokens\n", final_val_loss, val_len);
+    float final_val_loss = eval_val_loss(p, caches[0], val_tokens, val_len, chunk_len);
+    printf("final val_loss %.4f over %ld held-out tokens (100-chunk benchmark)\n", final_val_loss, val_len);
 
     if (tc_paramset_save(p, model_path) == 0) printf("saved weights to %s\n", model_path);
     else { fprintf(stderr, "failed to save weights\n"); return 1; }
