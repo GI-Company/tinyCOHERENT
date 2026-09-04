@@ -22,6 +22,7 @@
  *     fail the build the way a real attribution regression would. */
 #include "tcmodel.h"
 #include "tokenizer.h"
+#include "bpe.h"
 #include "glassbox.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,7 +116,7 @@ typedef struct { const int *targets; float base_loss; } LossBaseline;
 static float loss_shift(const TCParamSet *p, TCCache *c, const int *ids, int T,
                          const int *occ_positions, int k, const void *baseline) {
     const LossBaseline *bl = (const LossBaseline *)baseline;
-    int space_id = tc_encode_char(' ');
+    int space_id = (p->cfg.vocab_size > 256) ? 32 : tc_encode_char(' ');
     int tmp[256];
     memcpy(tmp, ids, sizeof(int) * (size_t)T);
     for (int i = 0; i < k; i++) tmp[occ_positions[i]] = space_id;
@@ -134,7 +135,7 @@ static float embed_shift(const TCParamSet *p, TCCache *c, const int *ids, int T,
     int tmp[256];
     memcpy(tmp, ids, sizeof(int) * (size_t)T);
     for (int i = 0; i < k; i++) tmp[occ_positions[i]] = space_id;
-    float vec[256];
+    float vec[TC_MAX_D_MODEL];
     tc_embed(p, c, tmp, T, vec);
     return 1.0f - tc_cosine(base_vec, vec, D);
 }
@@ -199,13 +200,29 @@ int main(int argc, char **argv) {
     TCParamSet *gen_random = tc_paramset_create(gen_cfg);
     tc_paramset_init_random(gen_random, 9999);
 
+    BPETokenizer *bpe = NULL;
+    if (gen_cfg.vocab_size > 256) {
+        const char *bpe_path = "data/bpe_merges.txt";
+        bpe = bpe_load(bpe_path);
+        if (!bpe) {
+            fprintf(stderr, "could not load BPE merges from %s\n", bpe_path);
+            return 1;
+        }
+        printf("bpe tokenizer:    %s (vocab=%d, %d merges)\n", bpe_path, bpe->vocab_size, bpe->num_merges);
+    }
+
     const char *prompt = prompt_override ? prompt_override
         : "the cat sat on the mat quietly, and the dog ran across the log slowly";
     int ids[256];
-    int T = encode(prompt, ids, gen_cfg.max_seq_len);
+    int T;
+    if (bpe) {
+        T = bpe_encode(bpe, prompt, ids, gen_cfg.max_seq_len);
+    } else {
+        T = encode(prompt, ids, gen_cfg.max_seq_len);
+    }
     int T_use = T - 1;
     const int *targets = ids + 1;
-    printf("faithcheck prompt: \"%.*s\"\n\n", T, prompt);
+    printf("faithcheck prompt: \"%s\" (tokens=%d)\n\n", prompt, T);
     printf("generative model: %s (d_model=%d, n_layers=%d, %d params)\n",
            gen_path, gen_cfg.d_model, gen_cfg.n_layers, gen->n_floats);
     if (emb) printf("embedder model:   %s (d_model=%d, n_layers=%d, %d params)\n",
@@ -214,6 +231,7 @@ int main(int argc, char **argv) {
     printf("\n");
 
     int overall_pass = 1;
+    int mask_token = (gen_cfg.vocab_size > 256) ? 32 : tc_encode_char(' ');
 
     /* --- surprise (diagnostic only, expected to fail) --- */
     {
@@ -235,7 +253,7 @@ int main(int argc, char **argv) {
     /* --- causal occlusion (generative head, real attribution) --- */
     {
         TCCausalStep steps[256];
-        int n = tc_explain_causal(gen, cache_gen, ids, T, tc_encode_char(' '), steps);
+        int n = tc_explain_causal(gen, cache_gen, ids, T, mask_token, steps);
         float imp[256];
         for (int i = 0; i < n; i++) imp[i] = steps[i].importance;
         int ranked[256];
@@ -255,7 +273,7 @@ int main(int argc, char **argv) {
         run_deletion_curve("causal-naive", ranked, n, gen, cache_gen, ids, T_use,
                             loss_shift, &bl, 23456, 0);
 
-        int min_gap = 3;
+        int min_gap = (bpe != NULL) ? 2 : 3;
         int diverse[8] = {0};
         int n_diverse = diverse_select(ranked, n, 5, min_gap, diverse);
         printf("== causal occlusion, diverse top-k (min_gap=%d, found %d/5 diverse candidates) ==\n",
@@ -265,13 +283,43 @@ int main(int argc, char **argv) {
         overall_pass &= pass_del;
 
         TCCausalStep steps_r[256];
-        tc_explain_causal(gen_random, cache_gen, ids, T, tc_encode_char(' '), steps_r);
+        tc_explain_causal(gen_random, cache_gen, ids, T, mask_token, steps_r);
         float imp_r[256];
         for (int i = 0; i < n; i++) imp_r[i] = steps_r[i].importance;
         float corr = pearson_corr(imp, imp_r, n);
         int pass_rand = fabsf(corr) < 0.5f;
         overall_pass &= pass_rand;
         printf("  [causal] randomization check: corr(trained, random) = %.3f  %s\n\n",
+               corr, pass_rand ? "PASS" : "FAIL");
+    }
+
+    /* --- input gradient attribution (fast analytical attribution) --- */
+    {
+        TCGradStep steps[256];
+        int n = tc_explain_input_grad(gen, cache_gen, ids, T, steps);
+        float imp[256];
+        for (int i = 0; i < n; i++) imp[i] = steps[i].importance;
+        int ranked[256];
+        argsort_desc(imp, n, ranked);
+        LossBaseline bl;
+        bl.targets = targets;
+        tc_forward(gen, cache_gen, ids, T_use, targets, &bl.base_loss);
+
+        int min_gap = 3;
+        int diverse[8] = {0};
+        int n_diverse = diverse_select(ranked, n, 5, min_gap, diverse);
+        printf("== input gradient attribution, diverse top-k (min_gap=%d, found %d/5 diverse candidates) ==\n",
+               min_gap, n_diverse);
+        run_deletion_curve("grad-diverse", diverse, n, gen, cache_gen, ids, T_use,
+                           loss_shift, &bl, 23456, 0);
+
+        TCGradStep steps_r[256];
+        tc_explain_input_grad(gen_random, cache_gen, ids, T, steps_r);
+        float imp_r[256];
+        for (int i = 0; i < n; i++) imp_r[i] = steps_r[i].importance;
+        float corr = pearson_corr(imp, imp_r, n);
+        int pass_rand = fabsf(corr) < 0.5f;
+        printf("  [grad] randomization check: corr(trained, random) = %.3f  %s\n\n",
                corr, pass_rand ? "PASS" : "FAIL");
     }
 
@@ -290,7 +338,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n; i++) imp[i] = steps[i].importance;
         int ranked[256];
         argsort_desc(imp, n, ranked);
-        float base_vec[256];
+        float base_vec[TC_MAX_D_MODEL];
         tc_embed(emb, cache_emb, ids, T_emb, base_vec);
         printf("== embedder occlusion ==\n");
         int pass_del = run_deletion_curve("embed", ranked, n, emb, cache_emb, ids, T_emb,
@@ -320,5 +368,6 @@ int main(int argc, char **argv) {
     tc_paramset_free(gen_random);
     tc_paramset_free(gen);
     if (emb) tc_paramset_free(emb);
+    if (bpe) bpe_free(bpe);
     return overall_pass ? 0 : 1;
 }

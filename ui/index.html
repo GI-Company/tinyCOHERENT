@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TinyCoherent Glass-Box Language Model Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="logo-badge">
+          <span class="logo-dot"></span>
+          <span class="logo-title">GLASSBOX</span>
+        </div>
+        <div class="header-meta">
+          <span class="model-tag">Rung 4 &bull; 3.95M &bull; BPE-2048</span>
+          <span class="status-indicator online" id="status-indicator">Engine Active</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <button class="preset-btn" id="btn-preset-story">Sample Story</button>
+        <button class="preset-btn" id="btn-preset-steer">Steering Demo</button>
+        <button class="preset-btn" id="btn-preset-rag">Grounded RAG</button>
+        <button class="preset-btn" id="btn-preset-probe">Known-Answer</button>
+      </div>
+    </header>
+
+    <!-- Main Grid -->
+    <main class="main-grid">
+      <!-- Left Column: Controls & Prompt -->
+      <section class="panel control-panel">
+        <div class="panel-header">
+          <h2>Input & Parameters</h2>
+          <span class="badge" id="token-count-badge">0 tokens</span>
+        </div>
+
+        <div class="form-group">
+          <label for="prompt-input">Prompt</label>
+          <textarea id="prompt-input" rows="4" placeholder="Enter prompt here (e.g. 'Once upon a time, Lily found a kitten in the garden...')">Once upon a time, Lily found a kitten. She smiled because</textarea>
+        </div>
+
+        <div class="controls-row">
+          <div class="control-item">
+            <div class="control-label">
+              <label for="temp-slider">Temperature</label>
+              <span id="temp-val">0.70</span>
+            </div>
+            <input type="range" id="temp-slider" min="0.0" max="1.5" step="0.05" value="0.70">
+          </div>
+          <div class="control-item">
+            <div class="control-label">
+              <label for="tokens-slider">Max Generation</label>
+              <span id="tokens-val">35</span>
+            </div>
+            <input type="range" id="tokens-slider" min="10" max="60" step="5" value="35">
+          </div>
+        </div>
+
+        <div class="actions-row">
+          <button class="btn btn-primary" id="btn-generate">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            Generate Response
+          </button>
+          <button class="btn btn-secondary" id="btn-clear">Clear</button>
+        </div>
+
+        <!-- Latent Activation Steering Card -->
+        <div class="steer-card">
+          <div class="steer-header">
+            <h3>Latent Activation Steering</h3>
+            <span class="badge badge-purple" id="steer-status-badge">Off</span>
+          </div>
+          <p class="card-desc">Inject concept vector &alpha;&middot;v into layer 2 residual stream to guide generation.</p>
+          <div class="steer-controls">
+            <div class="control-item">
+              <label for="steer-concept-select">Concept Direction</label>
+              <select id="steer-concept-select" class="select-input">
+                <option value="none">None (Standard Model)</option>
+                <option value="joy">Joy & Cheer (+joy / -sorrow)</option>
+                <option value="danger">Danger & Peril (+danger / -safety)</option>
+                <option value="magic">Magic & Arcane (+magic / -mundane)</option>
+                <option value="nature">Nature & Forest (+nature / -urban)</option>
+              </select>
+            </div>
+            <div class="control-item">
+              <div class="control-label">
+                <label for="steer-alpha-slider">Multiplier (&alpha;)</label>
+                <span id="steer-alpha-val">+2.5</span>
+              </div>
+              <input type="range" id="steer-alpha-slider" min="-5.0" max="5.0" step="0.25" value="2.5">
+            </div>
+          </div>
+          <div class="steer-preview" id="steer-preview" style="display: none;">
+            <div class="preview-label">Concept Vocabulary Shift:</div>
+            <div class="steer-tokens-container" id="steer-tokens-container"></div>
+          </div>
+        </div>
+
+        <!-- RAG Ingestion Card -->
+        <div class="rag-card">
+          <div class="rag-header">
+            <h3>Knowledge Store (RAG)</h3>
+            <span class="badge badge-accent" id="doc-count">2 documents</span>
+          </div>
+          <p class="card-desc">Inject factual passages and verify grounded attribution vs hallucination.</p>
+          <div class="doc-input-group">
+            <input type="text" id="doc-input" placeholder="Add factual passage into vector store...">
+            <button class="btn btn-sm" id="btn-add-doc">Ingest</button>
+          </div>
+          <div class="doc-list" id="doc-list">
+            <!-- Dynamic docs populated by app.js -->
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Generation & Interpretability -->
+      <section class="panel output-panel">
+        <div class="panel-header">
+          <h2>Output & Live Telemetry</h2>
+          <div class="telemetry-tags">
+            <span class="telemetry-pill purple" id="pill-steer" style="display: none;">Steering: joy (&alpha;=+2.5)</span>
+            <span class="telemetry-pill" id="pill-surprise">Surprise: 1.59 bits/tok</span>
+            <span class="telemetry-pill success" id="pill-confidence">High Confidence</span>
+            <span class="telemetry-pill accent" id="pill-grounding" style="display: none;">Grounding: 88.4%</span>
+          </div>
+        </div>
+
+        <!-- Generation stream -->
+        <div class="generation-box" id="generation-box">
+          <span class="placeholder-text">Click "Generate Response" to see streaming glass-box tokens.</span>
+        </div>
+
+        <!-- Interpretability Tabs -->
+        <div class="tabs-container">
+          <div class="tab-buttons">
+            <button class="tab-btn active" data-tab="tab-causal">Causal Attribution</button>
+            <button class="tab-btn" data-tab="tab-grad">Gradient Sensitivity</button>
+            <button class="tab-btn" data-tab="tab-heads">Attention Heads (32)</button>
+            <button class="tab-btn" data-tab="tab-grounding">Evidence Grounding</button>
+          </div>
+
+          <!-- Tab 1: Causal Attribution -->
+          <div class="tab-content active" id="tab-causal">
+            <div class="tab-meta-banner">
+              <span>Token Causal Loss Shift $\Delta \mathcal{L}$ (counterfactual token occlusion):</span>
+              <span class="hint-text">Click any token below to toggle occlusion!</span>
+            </div>
+            <div class="token-heatmap" id="causal-heatmap">
+              <!-- Tokens populated dynamically -->
+            </div>
+            <div class="bars-container" id="causal-bars">
+              <!-- Top attribution bars -->
+            </div>
+          </div>
+
+          <!-- Tab 2: Gradient Sensitivity -->
+          <div class="tab-content" id="tab-grad">
+            <div class="tab-meta-banner">
+              <span>Analytical Input $\times$ Gradient Sensitivity ($\nabla_{x_0} \mathcal{L}$):</span>
+              <span class="hint-text">$O(1)$ analytical backward pass</span>
+            </div>
+            <div class="token-heatmap" id="grad-heatmap">
+              <!-- Grad tokens populated dynamically -->
+            </div>
+            <div class="bars-container" id="grad-bars">
+              <!-- Grad bars -->
+            </div>
+          </div>
+
+          <!-- Tab 3: Mechanistic Attention Heads -->
+          <div class="tab-content" id="tab-heads">
+            <div class="tab-meta-banner">
+              <span>Circuit Analysis: Causal Ablation Loss Shift per Head ($L=4 \times H=8$):</span>
+              <span class="hint-text">Positive $\Delta \mathcal{L}$ indicates critical circuit</span>
+            </div>
+            <div class="heads-grid-wrapper">
+              <div class="heads-matrix" id="heads-matrix">
+                <!-- 4x8 Grid populated dynamically -->
+              </div>
+            </div>
+            <div class="head-legend">
+              <span class="legend-item"><span class="legend-dot high"></span> Critical Circuit (&gt; +0.010)</span>
+              <span class="legend-item"><span class="legend-dot med"></span> Moderate (&gt; +0.003)</span>
+              <span class="legend-item"><span class="legend-dot neutral"></span> Neutral</span>
+              <span class="legend-item"><span class="legend-dot suppressor"></span> Suppressor (&lt; -0.005)</span>
+            </div>
+          </div>
+
+          <!-- Tab 4: Evidence Grounding -->
+          <div class="tab-content" id="tab-grounding">
+            <div class="grounding-card">
+              <div class="grounding-meter-row">
+                <div class="meter-col">
+                  <div class="meter-val" id="grounding-meter-val">88.4%</div>
+                  <div class="meter-label">Evidence Grounding Ratio</div>
+                </div>
+                <div class="meter-desc" id="grounding-desc">
+                  The model's generation is overwhelmingly driven by the retrieved document tokens rather than parametric priors.
+                </div>
+              </div>
+              <div class="grounding-progress-bar">
+                <div class="grounding-fill" id="grounding-fill" style="width: 88.4%;"></div>
+              </div>
+              <div class="grounding-split-view" id="grounding-split-view">
+                <!-- Shows context tokens vs query tokens attribution -->
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

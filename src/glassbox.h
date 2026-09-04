@@ -57,4 +57,32 @@ int tc_explain_causal(const TCParamSet *p, TCCache *c, const int *ids, int T,
                        int occlude_id, TCCausalStep *out_steps);
 void tc_causal_glassbox_print(const TCCausalStep *steps, int n);
 
+typedef struct {
+    char ch;
+    float importance; /* Input x Grad: |dot(x0, d(loss)/d(x0))| */
+    float grad_norm;  /* ||d(loss)/d(x0)||_2 */
+} TCGradStep;
+
+/* Fast analytical attribution for the generative head: computes input embedding
+ * gradients in a single forward + backward pass O(1) instead of O(T) occlusion passes.
+ * ids has length T; forward pass evaluates ids[0..T-2] predicting ids[1..T-1] (T-1 steps).
+ * out_steps must hold at least T-1 entries. Returns T-1. */
+int tc_explain_input_grad(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                          TCGradStep *out_steps);
+void tc_grad_glassbox_print(const TCGradStep *steps, int n);
+
+/* Mechanistic interpretability: evaluates causal importance of every attention head
+ * by ablating each head individually and recording the resulting loss shift.
+ * ids has length T; evaluates predicting targets ids[1..T-1] (T-1 steps).
+ * out_heads must hold at least p->cfg.n_layers * p->cfg.n_heads entries.
+ * Returns total number of heads evaluated. */
+typedef struct {
+    int layer;
+    int head;
+    float importance; /* Loss shift when this head is ablated: L_ablated - L_base */
+} TCHeadImportance;
+
+int tc_explain_heads(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                     TCHeadImportance *out_heads);
+
 #endif

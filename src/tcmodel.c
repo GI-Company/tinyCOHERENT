@@ -7,12 +7,15 @@
 
 #define LN_EPS 1e-5f
 
-/* Several hot loops use fixed-size stack buffers sized for this toy
- * model's scale instead of alloca/VLA. Configs must stay within these
- * bounds or forward/backward will corrupt the stack. */
+#if defined(__APPLE__) && defined(ACCELERATE_NEW_LAPACK)
+#include <Accelerate/Accelerate.h>
+#endif
+
+/* Several hot loops use fixed-size stack buffers sized for models
+ * up to D=1024, FF=4096 instead of alloca/VLA. */
 static void tc_config_check(TCConfig cfg) {
-    assert(cfg.d_model > 0 && cfg.d_model <= 256);
-    assert(cfg.ff_mult > 0 && cfg.ff_mult * cfg.d_model <= 1024);
+    assert(cfg.d_model > 0 && cfg.d_model <= TC_MAX_D_MODEL);
+    assert(cfg.ff_mult > 0 && cfg.ff_mult * cfg.d_model <= TC_MAX_FF_DIM);
     assert(cfg.max_seq_len > 0 && cfg.max_seq_len <= 4096);
     assert(cfg.vocab_size > 0 && cfg.vocab_size <= 4096);
     assert(cfg.n_heads > 0 && cfg.d_model % cfg.n_heads == 0);
@@ -264,27 +267,46 @@ static inline float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 /* y = W x, W row-major [out x in] */
 static void matvec(const float *W, const float *x, float *y, int out, int in) {
+#if defined(__APPLE__) && defined(ACCELERATE_NEW_LAPACK)
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, out, in, 1.0f, W, in, x, 1, 0.0f, y, 1);
+#else
     for (int o = 0; o < out; o++) {
         float s = 0.0f;
         const float *row = W + (size_t)o * in;
         for (int i = 0; i < in; i++) s += row[i] * x[i];
         y[o] = s;
     }
+#endif
 }
 
 /* Accumulates dW += dy (x) x^T, dx += W^T dy. dx must already hold valid
  * data to accumulate into (caller zeroes once per position). */
 static void matvec_backward(const float *W, float *dW, const float *x, float *dx,
                              const float *dy, int out, int in) {
+#if defined(__APPLE__) && defined(ACCELERATE_NEW_LAPACK)
+    if (dW) {
+        cblas_sger(CblasRowMajor, out, in, 1.0f, dy, 1, x, 1, dW, in);
+    }
+    if (dx) {
+        cblas_sgemv(CblasRowMajor, CblasTrans, out, in, 1.0f, W, in, dy, 1, 1.0f, dx, 1);
+    }
+#else
     for (int o = 0; o < out; o++) {
         float dyo = dy[o];
         const float *row = W + (size_t)o * in;
-        float *drow = dW + (size_t)o * in;
-        for (int i = 0; i < in; i++) {
-            drow[i] += dyo * x[i];
-            dx[i] += row[i] * dyo;
+        if (dW) {
+            float *drow = dW + (size_t)o * in;
+            for (int i = 0; i < in; i++) {
+                drow[i] += dyo * x[i];
+            }
+        }
+        if (dx) {
+            for (int i = 0; i < in; i++) {
+                dx[i] += row[i] * dyo;
+            }
         }
     }
+#endif
 }
 
 static void ln_forward(const float *x, const float *gamma, const float *beta, int D,
@@ -308,16 +330,18 @@ static void ln_forward(const float *x, const float *gamma, const float *beta, in
 static void ln_backward(const float *dy, const float *xhat, const float *gamma,
                          float rstd, int D, float *dgamma, float *dbeta, float *dx) {
     float sum1 = 0.0f, sum2 = 0.0f;
-    float dxhat[256]; /* D is tiny (<=256 by construction of this toy model) */
+    float dxhat[TC_MAX_D_MODEL];
     for (int i = 0; i < D; i++) {
-        dgamma[i] += dy[i] * xhat[i];
-        dbeta[i] += dy[i];
+        if (dgamma) dgamma[i] += dy[i] * xhat[i];
+        if (dbeta) dbeta[i] += dy[i];
         dxhat[i] = dy[i] * gamma[i];
         sum1 += dxhat[i];
         sum2 += dxhat[i] * xhat[i];
     }
-    for (int i = 0; i < D; i++)
-        dx[i] += rstd * (dxhat[i] - sum1 / D - xhat[i] * sum2 / D);
+    if (dx) {
+        for (int i = 0; i < D; i++)
+            dx[i] += rstd * (dxhat[i] - sum1 / D - xhat[i] * sum2 / D);
+    }
 }
 
 /* ---------------------------------------------------------------------
@@ -328,14 +352,17 @@ static void ln_backward(const float *dy, const float *xhat, const float *gamma,
  * forward-declared here so any head's backward (generative, pooling, ...)
  * can call it regardless of definition order in this file. */
 static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
-                                const int *ids, int T, const float *dln_f_out);
+                                const int *ids, int T, const float *dln_f_out,
+                                float *out_dx0);
 
 /* Runs the shared layer stack + final LN, filling every cache field up to
  * and including c->ln_f_out. Both tc_forward (which adds the tied-embedding
  * head + softmax + loss) and tc_embed (which mean-pools instead) build on
  * this so the two specialist "heads" can never drift out of sync with the
- * body that produces them. */
-static void tc_encode(const TCParamSet *p, TCCache *c, const int *ids, int T) {
+ * body that produces them. Supports single-head ablation and latent steering. */
+static void tc_encode_ex(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                         int ablate_layer, int ablate_head,
+                         const TCSteerConfig *steer) {
     TCConfig cfg = p->cfg;
     int D = cfg.d_model, H = cfg.n_heads, Dh = D / H, FFD = cfg.ff_mult * D;
     float invsqrt_dh = 1.0f / sqrtf((float)Dh);
@@ -373,7 +400,7 @@ static void tc_encode(const TCParamSet *p, TCCache *c, const int *ids, int T) {
             }
             matvec(lv->tm_Wk, xk, lc->k + (size_t)t * D, D, D);
             matvec(lv->tm_Wv, xv, lc->v + (size_t)t * D, D, D);
-            float rpre[256];
+            float rpre[TC_MAX_D_MODEL];
             matvec(lv->tm_Wr, xr, rpre, D, D);
             float *rs = lc->r_sig + (size_t)t * D;
             for (int i = 0; i < D; i++) rs[i] = sigmoidf_(rpre[i]);
@@ -422,10 +449,12 @@ static void tc_encode(const TCParamSet *p, TCCache *c, const int *ids, int T) {
                 for (int u = 0; u <= t; u++) wrow[u] = scores[u] / sum;
                 float *ctx = lc->attn_ctx + (size_t)t * D + h * Dh;
                 for (int i = 0; i < Dh; i++) ctx[i] = 0.0f;
-                for (int u = 0; u <= t; u++) {
-                    const float *vh = lc->V + (size_t)u * D + h * Dh;
-                    float w = wrow[u];
-                    for (int i = 0; i < Dh; i++) ctx[i] += w * vh[i];
+                if (l != ablate_layer || h != ablate_head) {
+                    for (int u = 0; u <= t; u++) {
+                        const float *vh = lc->V + (size_t)u * D + h * Dh;
+                        float w = wrow[u];
+                        for (int i = 0; i < Dh; i++) ctx[i] += w * vh[i];
+                    }
                 }
             }
         }
@@ -458,7 +487,7 @@ static void tc_encode(const TCParamSet *p, TCCache *c, const int *ids, int T) {
             float *hrelu = lc->h_relu + (size_t)t * FFD;
             for (int i = 0; i < FFD; i++) hrelu[i] = hpre[i] > 0 ? hpre[i] : 0.0f;
             matvec(lv->cm_Wv, hrelu, lc->cm_v + (size_t)t * D, D, FFD);
-            float rpre[256];
+            float rpre[TC_MAX_D_MODEL];
             matvec(lv->cm_Wr, cmxr, rpre, D, D);
             float *r3 = lc->r3_sig + (size_t)t * D;
             for (int i = 0; i < D; i++) r3[i] = sigmoidf_(rpre[i]);
@@ -469,6 +498,21 @@ static void tc_encode(const TCParamSet *p, TCCache *c, const int *ids, int T) {
         }
 
         memcpy(x, lc->resid3, (size_t)T * D * sizeof(float));
+
+        /* Latent activation steering injection */
+        if (steer && steer->layer == l && steer->vec && fabsf(steer->alpha) > 1e-7f) {
+            float a = steer->alpha;
+            const float *v = steer->vec;
+            for (int t = 0; t < T; t++) {
+                float *xt = x + (size_t)t * D;
+                float *r3 = lc->resid3 + (size_t)t * D;
+                for (int i = 0; i < D; i++) {
+                    float delta = a * v[i];
+                    xt[i] += delta;
+                    r3[i] += delta;
+                }
+            }
+        }
     }
 
     /* --- final LN --- */
@@ -480,12 +524,17 @@ static void tc_encode(const TCParamSet *p, TCCache *c, const int *ids, int T) {
     free(x);
 }
 
+static void tc_encode(const TCParamSet *p, TCCache *c, const int *ids, int T) {
+    tc_encode_ex(p, c, ids, T, -1, -1, NULL);
+}
+
 /* Generative head: tied-embedding projection + softmax + (optional) loss. */
-void tc_forward(const TCParamSet *p, TCCache *c, const int *ids, int T,
-                 const int *targets, float *out_loss) {
-    tc_encode(p, c, ids, T);
+void tc_forward_ex(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                   const int *targets, float *out_loss, int ablate_layer, int ablate_head) {
+    tc_encode_ex(p, c, ids, T, ablate_layer, ablate_head, NULL);
     int V = p->cfg.vocab_size, D = p->cfg.d_model;
     float total_loss = 0.0f;
+    int n_active = 0;
     for (int t = 0; t < T; t++) {
         float *logit = c->logits + (size_t)t * V;
         matvec(p->embed, c->ln_f_out + (size_t)t * D, logit, V, D);
@@ -495,13 +544,45 @@ void tc_forward(const TCParamSet *p, TCCache *c, const int *ids, int T,
         float *prob = c->probs + (size_t)t * V;
         for (int i = 0; i < V; i++) { prob[i] = expf(logit[i] - maxv); sum += prob[i]; }
         for (int i = 0; i < V; i++) prob[i] /= sum;
-        if (targets) {
+        if (targets && targets[t] >= 0) {
             float pt = prob[targets[t]];
             if (pt < 1e-9f) pt = 1e-9f;
             total_loss += -logf(pt);
+            n_active++;
         }
     }
-    if (targets && out_loss) *out_loss = total_loss / T;
+    if (targets && out_loss) *out_loss = n_active > 0 ? (total_loss / (float)n_active) : 0.0f;
+}
+
+void tc_forward(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                 const int *targets, float *out_loss) {
+    tc_forward_ex(p, c, ids, T, targets, out_loss, -1, -1);
+}
+
+/* Generative head with latent activation steering */
+void tc_forward_steered(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                        const int *targets, float *out_loss, const TCSteerConfig *steer) {
+    tc_encode_ex(p, c, ids, T, -1, -1, steer);
+    int V = p->cfg.vocab_size, D = p->cfg.d_model;
+    float total_loss = 0.0f;
+    int n_active = 0;
+    for (int t = 0; t < T; t++) {
+        float *logit = c->logits + (size_t)t * V;
+        matvec(p->embed, c->ln_f_out + (size_t)t * D, logit, V, D);
+        float maxv = -1e30f;
+        for (int i = 0; i < V; i++) if (logit[i] > maxv) maxv = logit[i];
+        float sum = 0.0f;
+        float *prob = c->probs + (size_t)t * V;
+        for (int i = 0; i < V; i++) { prob[i] = expf(logit[i] - maxv); sum += prob[i]; }
+        for (int i = 0; i < V; i++) prob[i] /= sum;
+        if (targets && targets[t] >= 0) {
+            float pt = prob[targets[t]];
+            if (pt < 1e-9f) pt = 1e-9f;
+            total_loss += -logf(pt);
+            n_active++;
+        }
+    }
+    if (targets && out_loss) *out_loss = n_active > 0 ? (total_loss / (float)n_active) : 0.0f;
 }
 
 /* Embedding head: take the LAST position's final hidden state and
@@ -548,7 +629,7 @@ void tc_embed(const TCParamSet *p, TCCache *c, const int *ids, int T, float *out
 void tc_embed_backward(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
                         const int *ids, int T, const float *d_out_vec) {
     int D = p->cfg.d_model;
-    float out_vec[256], d_raw[256];
+    float out_vec[TC_MAX_D_MODEL], d_raw[TC_MAX_D_MODEL];
     for (int i = 0; i < D; i++) out_vec[i] = c->pool_raw[i] / c->pool_norm;
 
     /* L2-normalize backward: out = raw/norm => d_raw = (d_out - out*<d_out,out>)/norm */
@@ -584,7 +665,7 @@ void tc_embed_backward(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
         }
     }
 
-    tc_encode_backward(p, grad, c, ids, T, dln_f_out);
+    tc_encode_backward(p, grad, c, ids, T, dln_f_out, NULL);
     free(dln_f_out);
 }
 
@@ -605,7 +686,8 @@ float tc_cosine(const float *a, const float *b, int D) {
  * softmax, pooling, future heads) can drive this once it has reduced its
  * own loss down to a gradient on the encoder's output. */
 static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
-                                const int *ids, int T, const float *dln_f_out) {
+                                const int *ids, int T, const float *dln_f_out,
+                                float *out_dx0) {
     TCConfig cfg = p->cfg;
     int D = cfg.d_model, H = cfg.n_heads, Dh = D / H, FFD = cfg.ff_mult * D;
     float invsqrt_dh = 1.0f / sqrtf((float)Dh);
@@ -616,14 +698,17 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
 
     for (int t = 0; t < T; t++) {
         ln_backward(dln_f_out + (size_t)t * D, c->ln_f_xhat + (size_t)t * D, p->ln_f_gamma,
-                    c->ln_f_rstd[t], D, grad->ln_f_gamma, grad->ln_f_beta, dx_final + (size_t)t * D);
+                    c->ln_f_rstd[t], D,
+                    grad ? grad->ln_f_gamma : NULL,
+                    grad ? grad->ln_f_beta : NULL,
+                    dx_final + (size_t)t * D);
     }
 
     float *dx_next = dx_final; /* grad w.r.t. output of layer l (resid3) */
 
     for (int l = cfg.n_layers - 1; l >= 0; l--) {
         TCLayerView *lv = &p->layers[l];
-        TCLayerView *glv = &grad->layers[l];
+        TCLayerView *glv = grad ? &grad->layers[l] : NULL;
         const TCLayerCache *lc = &c->layers[l];
         TCLayerCache *dlc = &dc->layers[l];
 
@@ -635,22 +720,22 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
             float *dcmo = dlc->cm_out + (size_t)t * D;
             const float *r3 = lc->r3_sig + (size_t)t * D;
             const float *cmv = lc->cm_v + (size_t)t * D;
-            float dr3[256], dcmv[256];
+            float dr3[TC_MAX_D_MODEL], dcmv[TC_MAX_D_MODEL];
             for (int i = 0; i < D; i++) {
                 dr3[i] = dcmo[i] * cmv[i];
                 dcmv[i] = dcmo[i] * r3[i];
             }
-            float drpre[256];
+            float drpre[TC_MAX_D_MODEL];
             for (int i = 0; i < D; i++) drpre[i] = dr3[i] * r3[i] * (1 - r3[i]);
-            float dcmxr[256] = {0};
-            matvec_backward(lv->cm_Wr, glv->cm_Wr, lc->cmxr + (size_t)t * D, dcmxr, drpre, D, D);
+            float dcmxr[TC_MAX_D_MODEL] = {0};
+            matvec_backward(lv->cm_Wr, glv ? glv->cm_Wr : NULL, lc->cmxr + (size_t)t * D, dcmxr, drpre, D, D);
 
-            float dhrelu[1024] = {0};
-            matvec_backward(lv->cm_Wv, glv->cm_Wv, lc->h_relu + (size_t)t * FFD, dhrelu, dcmv, D, FFD);
-            float dhpre[1024];
+            float dhrelu[TC_MAX_FF_DIM] = {0};
+            matvec_backward(lv->cm_Wv, glv ? glv->cm_Wv : NULL, lc->h_relu + (size_t)t * FFD, dhrelu, dcmv, D, FFD);
+            float dhpre[TC_MAX_FF_DIM];
             for (int i = 0; i < FFD; i++) dhpre[i] = lc->h_pre[(size_t)t * FFD + i] > 0 ? dhrelu[i] : 0.0f;
-            float dcmxk[256] = {0};
-            matvec_backward(lv->cm_Wk, glv->cm_Wk, lc->cmxk + (size_t)t * D, dcmxk, dhpre, FFD, D);
+            float dcmxk[TC_MAX_D_MODEL] = {0};
+            matvec_backward(lv->cm_Wk, glv ? glv->cm_Wk : NULL, lc->cmxk + (size_t)t * D, dcmxk, dhpre, FFD, D);
 
             /* token-shift split for cmxk/cmxr back into d(ln3_out[t]) and d(ln3_out[t-1]) */
             const float *cur = lc->ln3_out + (size_t)t * D;
@@ -665,15 +750,20 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
                 if (t > 0) {
                     dlc->ln3_out[(size_t)(t - 1) * D + i] += dcmxk[i] * (1 - mk) + dcmxr[i] * (1 - mr);
                 }
-                float dmk = dcmxk[i] * (cur_i - prev_i);
-                float dmr = dcmxr[i] * (cur_i - prev_i);
-                glv->cm_mix_k[i] += dmk * mk * (1 - mk);
-                glv->cm_mix_r[i] += dmr * mr * (1 - mr);
+                if (glv) {
+                    float dmk = dcmxk[i] * (cur_i - prev_i);
+                    float dmr = dcmxr[i] * (cur_i - prev_i);
+                    glv->cm_mix_k[i] += dmk * mk * (1 - mk);
+                    glv->cm_mix_r[i] += dmr * mr * (1 - mr);
+                }
             }
         }
         for (int t = 0; t < T; t++) {
             ln_backward(dlc->ln3_out + (size_t)t * D, lc->ln3_xhat + (size_t)t * D, lv->ln3_gamma,
-                        lc->ln3_rstd[t], D, glv->ln3_gamma, glv->ln3_beta, dlc->resid2 + (size_t)t * D);
+                        lc->ln3_rstd[t], D,
+                        glv ? glv->ln3_gamma : NULL,
+                        glv ? glv->ln3_beta : NULL,
+                        dlc->resid2 + (size_t)t * D);
         }
 
         /* resid2 = resid1 + attn_out */
@@ -681,7 +771,7 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
         memcpy(dlc->attn_out, dlc->resid2, (size_t)T * D * sizeof(float));
 
         for (int t = 0; t < T; t++)
-            matvec_backward(lv->at_Wo, glv->at_Wo, lc->attn_ctx + (size_t)t * D,
+            matvec_backward(lv->at_Wo, glv ? glv->at_Wo : NULL, lc->attn_ctx + (size_t)t * D,
                              dlc->attn_ctx + (size_t)t * D, dlc->attn_out + (size_t)t * D, D, D);
 
         for (int h = 0; h < H; h++) {
@@ -711,11 +801,13 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
 
         for (int t = 0; t < T; t++) {
             float *dln2 = dlc->ln2_out + (size_t)t * D;
-            matvec_backward(lv->at_Wq, glv->at_Wq, lc->ln2_out + (size_t)t * D, dln2, dlc->Q + (size_t)t * D, D, D);
-            matvec_backward(lv->at_Wk, glv->at_Wk, lc->ln2_out + (size_t)t * D, dln2, dlc->K + (size_t)t * D, D, D);
-            matvec_backward(lv->at_Wv, glv->at_Wv, lc->ln2_out + (size_t)t * D, dln2, dlc->V + (size_t)t * D, D, D);
+            matvec_backward(lv->at_Wq, glv ? glv->at_Wq : NULL, lc->ln2_out + (size_t)t * D, dln2, dlc->Q + (size_t)t * D, D, D);
+            matvec_backward(lv->at_Wk, glv ? glv->at_Wk : NULL, lc->ln2_out + (size_t)t * D, dln2, dlc->K + (size_t)t * D, D, D);
+            matvec_backward(lv->at_Wv, glv ? glv->at_Wv : NULL, lc->ln2_out + (size_t)t * D, dln2, dlc->V + (size_t)t * D, D, D);
             ln_backward(dln2, lc->ln2_xhat + (size_t)t * D, lv->ln2_gamma, lc->ln2_rstd[t], D,
-                        glv->ln2_gamma, glv->ln2_beta, dlc->resid1 + (size_t)t * D);
+                        glv ? glv->ln2_gamma : NULL,
+                        glv ? glv->ln2_beta : NULL,
+                        dlc->resid1 + (size_t)t * D);
         }
 
         /* resid1 = x0 + tm_out */
@@ -723,7 +815,7 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
         memcpy(dlc->tm_out, dlc->resid1, (size_t)T * D * sizeof(float));
 
         for (int t = 0; t < T; t++)
-            matvec_backward(lv->tm_Wo, glv->tm_Wo, lc->wkv + (size_t)t * D,
+            matvec_backward(lv->tm_Wo, glv ? glv->tm_Wo : NULL, lc->wkv + (size_t)t * D,
                              dlc->wkv + (size_t)t * D, dlc->tm_out + (size_t)t * D, D, D);
 
         /* recurrence backward, reverse time order (state[t] depends on state[t-1]) */
@@ -731,18 +823,18 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
             const float *rs = lc->r_sig + (size_t)t * D;
             const float *st = lc->state + (size_t)t * D;
             float *dwkv = dlc->wkv + (size_t)t * D;
-            float drs[256], dst[256];
+            float drs[TC_MAX_D_MODEL], dst[TC_MAX_D_MODEL];
             for (int i = 0; i < D; i++) {
                 drs[i] = dwkv[i] * st[i];
                 dst[i] = dwkv[i] * rs[i] + dlc->state[(size_t)t * D + i]; /* += grad flowing from state[t+1] */
             }
-            float drpre[256];
+            float drpre[TC_MAX_D_MODEL];
             for (int i = 0; i < D; i++) drpre[i] = drs[i] * rs[i] * (1 - rs[i]);
-            float dxr_lin[256] = {0};
-            matvec_backward(lv->tm_Wr, glv->tm_Wr, lc->xr + (size_t)t * D, dxr_lin, drpre, D, D);
+            float dxr_lin[TC_MAX_D_MODEL] = {0};
+            matvec_backward(lv->tm_Wr, glv ? glv->tm_Wr : NULL, lc->xr + (size_t)t * D, dxr_lin, drpre, D, D);
 
             const float *kt = lc->k + (size_t)t * D, *vt = lc->v + (size_t)t * D;
-            float dk[256], dv[256];
+            float dk[TC_MAX_D_MODEL], dv[TC_MAX_D_MODEL];
             for (int i = 0; i < D; i++) {
                 float decay = sigmoidf_(lv->tm_decay[i]);
                 float sp = t > 0 ? lc->state[(size_t)(t - 1) * D + i] : 0.0f;
@@ -750,15 +842,17 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
                 dk[i] = dst[i] * dgate * vt[i];
                 dv[i] = dst[i] * dgate * kt[i];
                 if (t > 0) dlc->state[(size_t)(t - 1) * D + i] += dst[i] * decay;
-                float ddecay_pre = dst[i] * (sp - kt[i] * vt[i]) * decay * (1 - decay);
-                glv->tm_decay[i] += ddecay_pre;
+                if (glv) {
+                    float ddecay_pre = dst[i] * (sp - kt[i] * vt[i]) * decay * (1 - decay);
+                    glv->tm_decay[i] += ddecay_pre;
+                }
             }
-            float dxk_lin[256] = {0}, dxv_lin[256] = {0};
-            matvec_backward(lv->tm_Wk, glv->tm_Wk, lc->xk + (size_t)t * D, dxk_lin, dk, D, D);
-            matvec_backward(lv->tm_Wv, glv->tm_Wv, lc->xv + (size_t)t * D, dxv_lin, dv, D, D);
+            float dxk_lin[TC_MAX_D_MODEL] = {0}, dxv_lin[TC_MAX_D_MODEL] = {0};
+            matvec_backward(lv->tm_Wk, glv ? glv->tm_Wk : NULL, lc->xk + (size_t)t * D, dxk_lin, dk, D, D);
+            matvec_backward(lv->tm_Wv, glv ? glv->tm_Wv : NULL, lc->xv + (size_t)t * D, dxv_lin, dv, D, D);
 
-            float cur_k[256], cur_v[256], cur_r[256];
-            float prev_k[256] = {0}, prev_v[256] = {0}, prev_r[256] = {0};
+            float cur_k[TC_MAX_D_MODEL], cur_v[TC_MAX_D_MODEL], cur_r[TC_MAX_D_MODEL];
+            float prev_k[TC_MAX_D_MODEL] = {0}, prev_v[TC_MAX_D_MODEL] = {0}, prev_r[TC_MAX_D_MODEL] = {0};
             for (int i = 0; i < D; i++) {
                 cur_k[i] = lc->ln1_out[(size_t)t * D + i];
                 cur_v[i] = cur_k[i]; cur_r[i] = cur_k[i];
@@ -773,26 +867,36 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
                     dlc->ln1_out[(size_t)(t - 1) * D + i] +=
                         dxk_lin[i] * (1 - mk) + dxv_lin[i] * (1 - mv) + dxr_lin[i] * (1 - mr);
                 }
-                float dmk = dxk_lin[i] * (cur_k[i] - prev_k[i]);
-                float dmv = dxv_lin[i] * (cur_v[i] - prev_v[i]);
-                float dmr = dxr_lin[i] * (cur_r[i] - prev_r[i]);
-                glv->tm_mix_k[i] += dmk * mk * (1 - mk);
-                glv->tm_mix_v[i] += dmv * mv * (1 - mv);
-                glv->tm_mix_r[i] += dmr * mr * (1 - mr);
+                if (glv) {
+                    float dmk = dxk_lin[i] * (cur_k[i] - prev_k[i]);
+                    float dmv = dxv_lin[i] * (cur_v[i] - prev_v[i]);
+                    float dmr = dxr_lin[i] * (cur_r[i] - prev_r[i]);
+                    glv->tm_mix_k[i] += dmk * mk * (1 - mk);
+                    glv->tm_mix_v[i] += dmv * mv * (1 - mv);
+                    glv->tm_mix_r[i] += dmr * mr * (1 - mr);
+                }
             }
         }
         for (int t = 0; t < T; t++)
             ln_backward(dlc->ln1_out + (size_t)t * D, lc->ln1_xhat + (size_t)t * D, lv->ln1_gamma,
-                        lc->ln1_rstd[t], D, glv->ln1_gamma, glv->ln1_beta, dlc->x0 + (size_t)t * D);
+                        lc->ln1_rstd[t], D,
+                        glv ? glv->ln1_gamma : NULL,
+                        glv ? glv->ln1_beta : NULL,
+                        dlc->x0 + (size_t)t * D);
 
         if (l > 0) {
             dx_next = dc->layers[l - 1].resid3; /* alias: previous layer's output grad */
             memcpy(dx_next, dlc->x0, (size_t)T * D * sizeof(float));
         } else {
-            /* d(embed) for the input tokens */
-            for (int t = 0; t < T; t++) {
-                float *derow = grad->embed + (size_t)ids[t] * D;
-                for (int i = 0; i < D; i++) derow[i] += dlc->x0[(size_t)t * D + i];
+            if (out_dx0) {
+                memcpy(out_dx0, dlc->x0, (size_t)T * D * sizeof(float));
+            }
+            if (grad) {
+                /* d(embed) for the input tokens */
+                for (int t = 0; t < T; t++) {
+                    float *derow = grad->embed + (size_t)ids[t] * D;
+                    for (int i = 0; i < D; i++) derow[i] += dlc->x0[(size_t)t * D + i];
+                }
             }
         }
     }
@@ -801,35 +905,55 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
     tc_cache_free(dc);
 }
 
-/* Generative head backward: dLogits = probs - onehot(target), reduced
- * through the tied-embedding projection (which is also grad'd here, on
- * its output-side use) down to d(ln_f_out), then handed to the shared
- * encoder backward. Requires targets to have been passed to tc_forward. */
-void tc_backward(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
-                  const int *ids, int T, const int *targets) {
+/* Generative head backward: supports masked targets (targets[t] < 0) and optional out_dx0 */
+void tc_backward_ex(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
+                    const int *ids, int T, const int *targets, float *out_dx0) {
     int D = p->cfg.d_model, V = p->cfg.vocab_size;
     float *dln_f_out = calloc((size_t)T * D, sizeof(float));
 
+    int n_active = 0;
     for (int t = 0; t < T; t++) {
+        if (targets[t] >= 0) n_active++;
+    }
+    float inv_n = n_active > 0 ? (1.0f / (float)n_active) : 0.0f;
+
+    for (int t = 0; t < T; t++) {
+        int target = targets[t];
+        if (target < 0) continue;
+
         float dlogit[4096];
         const float *prob = c->probs + (size_t)t * V;
-        for (int i = 0; i < V; i++) dlogit[i] = prob[i] / T;
-        dlogit[targets[t]] -= 1.0f / T;
+        for (int i = 0; i < V; i++) dlogit[i] = prob[i] * inv_n;
+        dlogit[target] -= inv_n;
 
         float *dlnf = dln_f_out + (size_t)t * D;
         for (int o = 0; o < V; o++) {
             float dlo = dlogit[o];
             const float *erow = p->embed + (size_t)o * D;
-            float *derow = grad->embed + (size_t)o * D;
-            const float *xin = c->ln_f_out + (size_t)t * D;
+            if (grad) {
+                float *derow = grad->embed + (size_t)o * D;
+                const float *xin = c->ln_f_out + (size_t)t * D;
+                for (int i = 0; i < D; i++) {
+                    derow[i] += dlo * xin[i];
+                }
+            }
             for (int i = 0; i < D; i++) {
-                derow[i] += dlo * xin[i];
                 dlnf[i] += erow[i] * dlo;
             }
         }
     }
-    tc_encode_backward(p, grad, c, ids, T, dln_f_out);
+    tc_encode_backward(p, grad, c, ids, T, dln_f_out, out_dx0);
     free(dln_f_out);
+}
+
+void tc_backward(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
+                 const int *ids, int T, const int *targets) {
+    tc_backward_ex(p, grad, c, ids, T, targets, NULL);
+}
+
+void tc_input_grad(const TCParamSet *p, const TCCache *c,
+                   const int *ids, int T, const int *targets, float *out_dx0) {
+    tc_backward_ex(p, NULL, c, ids, T, targets, out_dx0);
 }
 
 static unsigned int xrand(unsigned int *s) {

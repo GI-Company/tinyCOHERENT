@@ -80,11 +80,51 @@ int main(void) {
         }
     }
 
+    printf("--- standard unmasked gradcheck ---\n");
     printf("checked %d params, %d failed tolerance, worst margin = %.6f\n", checked, failed, worst_margin);
-    printf(failed == 0 ? "GRADCHECK PASS\n" : "GRADCHECK FAIL\n");
+
+    /* --- test case 2: masked targets (prefix and alternating) --- */
+    printf("--- masked targets gradcheck (prefix & alternating mask) ---\n");
+    int masked_targets[6] = {-1, -1, -1, targets[3], -1, targets[5]};
+    float base_loss_masked;
+    tc_forward(p, c, ids, T, masked_targets, &base_loss_masked);
+    tc_paramset_zero(grad);
+    tc_backward(p, grad, c, ids, T, masked_targets);
+
+    printf("masked targets base loss = %f (active targets at t=3, 5)\n", base_loss_masked);
+    float worst_margin_masked = -1e30f;
+    int checked_masked = 0, failed_masked = 0;
+
+    for (int i = 0; i < p->n_floats; i += stride) {
+        float orig = p->buf[i];
+        p->buf[i] = orig + eps;
+        float lp = run_loss(p, c, ids, T, masked_targets);
+        p->buf[i] = orig - eps;
+        float lm = run_loss(p, c, ids, T, masked_targets);
+        p->buf[i] = orig;
+
+        float numeric = (lp - lm) / (2 * eps);
+        float analytic = grad->buf[i];
+        float diff = fabsf(numeric - analytic);
+        float tol = atol + rtol * fabsf(analytic);
+        float margin = diff - tol;
+        checked_masked++;
+        if (margin > worst_margin_masked) worst_margin_masked = margin;
+        if (margin > 0.0f) {
+            failed_masked++;
+            printf("  MASKED MISMATCH idx=%d numeric=%.6f analytic=%.6f diff=%.6f tol=%.6f\n",
+                   i, numeric, analytic, diff, tol);
+        }
+    }
+
+    printf("checked %d params (masked), %d failed tolerance, worst margin = %.6f\n",
+           checked_masked, failed_masked, worst_margin_masked);
+
+    int total_failed = failed + failed_masked;
+    printf(total_failed == 0 ? "GRADCHECK PASS\n" : "GRADCHECK FAIL\n");
 
     tc_cache_free(c);
     tc_paramset_free(grad);
     tc_paramset_free(p);
-    return failed == 0 ? 0 : 1;
+    return total_failed == 0 ? 0 : 1;
 }

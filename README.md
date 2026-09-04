@@ -56,39 +56,41 @@ project's attribution methods are:
   (the ratio metric and some capacity-axis claims explicitly haven't),
   and that document says so plainly rather than rounding up.
 
-## Current scale and its limit
+## Scaling milestones
 
-The model here is deliberately tiny (~8k parameters, `d_model=16`,
-2 layers) and trains in seconds on one CPU core. That's not a
-placeholder for something bigger by default — it's the scale at which
-every claim above could be verified within a single working session.
-
-The real ceiling on scaling this further isn't parameter count, it's the
-implementation: `tcmodel.c` is naive, single-threaded C with no BLAS, no
-SIMD, no threading. Cost scales with `d_model²`, so this codebase as
-written stays fast up to roughly 100k-500k parameters (`d_model` in the
-low hundreds) and gets impractical well before 10M+ — at that point a
-single forward pass is billions of scalar multiply-adds, and training
-runs move from seconds to hours-to-days. Scaling further is a real
-systems-engineering project (a BLAS/Accelerate-backed rewrite of the
-matvec core), not a config change, and would also need a real training
-corpus — the 400-sentence synthetic template corpus here is intentionally
-just large enough to test the mechanism, not to train anything bigger
-than a toy without immediately overfitting.
+- **Oracle (~8k params, `d_model=16`)**: fast finite-difference baseline on synthetic templates.
+- **Rung 2 (~222k params, `d_model=64`)**: [`SCALE_200k.md`](SCALE_200k.md) — trained on TinyStories, discovered and resolved greedy top-k deletion curve redundancy.
+- **Rung 3 (~3.45M params, `d_model=256`)**: [`SCALE_3M.md`](SCALE_3M.md) — Apple Accelerate BLAS acceleration, verified faithful attribution under diverse deletion curves and weight randomization.
+- **Rung 4 (~3.95M–21.5M params, subword BPE, GCD multi-core)**: [`SCALE_RUNG4.md`](SCALE_RUNG4.md) — pure-C byte-level BPE tokenizer ($V=2048$), multi-core parallel batch training ($>4,200$ tok/s), eliminates character redundancy so naive top-$k$ deletion curves pass cleanly at every $k$, and interactive glass-box chat with word-level causal and input-gradient attribution.
+- **Rung 5 (Grounded Glass-Box RAG, Mechanistic Head Attribution & Visual Studio)**: causal mediation loss shifts across all 32 attention heads ($L=4, H=8$), in-memory grounded RAG with exact Evidence Grounding Ratio & hallucination detection, and an interactive dark-mode visual studio web dashboard (`make ui`).
+- **Milestone 1 Alignment (Instruction SFT & Conversational Glass-Box)**: prompt-masked loss training over 3,500 dialogue pairs, stop sequence delimiter monitoring (`<|endoftext|>`, `User:`), and query-focused attribution in chat (`make train_sft`, `make chat_sft`).
+- **Milestone 2 Steering (Latent Activation Steering & Concept Vectors)**: in-engine latent activation injection ($x_{t, l^*} \leftarrow x_{t, l^*} + \alpha \hat{\mathbf{v}}_{l^*}$), concept vector bank (`joy`, `danger`, `magic`, `nature`), vocabulary projection inspection ($\Delta \mathbf{z} = W_{\text{embed}} \cdot \hat{\mathbf{v}}$), zero-overhead equivalence at $\alpha=0$, and REPL/Web studio interactive controls (`make extract_steer`, `make test_steer`).
+- **Milestone 3 Scaling (Rung 6 ~21.5M Parameter Architecture)**: [`SCALE_RUNG6.md`](SCALE_RUNG6.md) — 21,534,208 parameters ($D=512, L=6, H=8, V=2048, \text{ff\_mult}=2$), Apple Accelerate SIMD BLAS matrix-vector kernels (`cblas_sgemv`, `cblas_sger`), multi-core GCD parallel batch training, and verified glass-box faithfulness.
 
 ## Building and running
 
 ```
-make gradcheck        # verify the hand-derived backward pass
+make gradcheck        # verify the hand-derived backward pass (unmasked & masked loss)
 make embed_gradcheck  # same, for the embedder's attention-pooling head
 make train             # train the generative specialist, train/val split
+make train_scale       # train Rung 4 scale model with BPE and multi-core GCD
+make train_rung6       # train Rung 6 21.5M scale model with BLAS and multi-core GCD
+make train_sft         # instruction fine-tuning on dialogue pairs with prompt masking
+make extract_steer     # extract curated concept steering vectors into binary bank
+make test_steer        # verify activation steering (zero-shift equivalence & monotonicity)
 make embed_train       # contrastively train the embedder
+make chat              # interactive glass-box terminal chat (model_rung3.bin)
+make chat_rung4        # interactive glass-box terminal chat with BPE (model_rung4.bin)
+make chat_rung6        # interactive glass-box terminal chat with Rung 6 (model_rung6.bin)
+make chat_sft          # interactive conversational assistant with query attribution & steering
+make ui                # launch the interactive visual glass-box web studio with steering controls
 make dag                # 2-node DAG demo: generate -> explain
 make rag                 # 3-node DAG demo: retrieve -> generate -> explain
 make faithcheck            # attribution faithfulness gate (pass/fail)
+make faithcheck_rung4      # attribution faithfulness gate for Rung 4 BPE model
+make faithcheck_rung6      # attribution faithfulness gate for Rung 6 21.5M model
 make known_answer           # ground-truth attribution test
 make degrade_test            # ./build/degrade_test <noise_p> <jitter_q> <capacity_divisor> [seed]
 ```
 
-See [`DEGRADE.md`](DEGRADE.md) for the full degradation-sweep methodology,
-results, and caveats.
+See [`DEGRADE.md`](DEGRADE.md), [`SCALE_200k.md`](SCALE_200k.md), [`SCALE_3M.md`](SCALE_3M.md), [`SCALE_RUNG4.md`](SCALE_RUNG4.md), and [`SCALE_RUNG6.md`](SCALE_RUNG6.md) for experimental methodology, results, and caveats.

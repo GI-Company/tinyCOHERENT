@@ -60,7 +60,7 @@ void tc_glassbox_print(const TCGlassBoxStep *steps, int n) {
 int tc_explain_embedding(const TCParamSet *p, TCCache *c, const int *ids, int T,
                           TCEmbedOcclusionStep *out_steps) {
     int D = p->cfg.d_model;
-    float base[256], occluded_vec[256];
+    float base[TC_MAX_D_MODEL], occluded_vec[TC_MAX_D_MODEL];
     tc_embed(p, c, ids, T, base);
 
     int *occ_ids = malloc(sizeof(int) * (size_t)T);
@@ -141,4 +141,75 @@ void tc_embed_glassbox_print(const TCEmbedOcclusionStep *steps, int n) {
         for (int k = 0; k < bar_len; k++) putchar('#');
         printf("\n");
     }
+}
+
+int tc_explain_input_grad(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                          TCGradStep *out_steps) {
+    if (T < 2) return 0;
+    int T_use = T - 1;
+    const int *targets = ids + 1;
+    int D = p->cfg.d_model;
+
+    float loss;
+    tc_forward(p, c, ids, T_use, targets, &loss);
+
+    float *dx0 = calloc((size_t)T_use * D, sizeof(float));
+    tc_input_grad(p, c, ids, T_use, targets, dx0);
+
+    for (int t = 0; t < T_use; t++) {
+        int tok = ids[t];
+        const float *emb = p->embed + (size_t)tok * D;
+        const float *g = dx0 + (size_t)t * D;
+
+        float dot = 0.0f;
+        float norm_sq = 0.0f;
+        for (int d = 0; d < D; d++) {
+            dot += emb[d] * g[d];
+            norm_sq += g[d] * g[d];
+        }
+        out_steps[t].ch = tc_decode_id(tok);
+        out_steps[t].grad_norm = sqrtf(norm_sq);
+        out_steps[t].importance = fabsf(dot);
+    }
+    free(dx0);
+    return T_use;
+}
+
+void tc_grad_glassbox_print(const TCGradStep *steps, int n) {
+    printf("%-6s %-12s %-12s  %s\n", "char", "Input x Grad", "Grad Norm", "(analytical gradient attribution)");
+    float max_imp = 1e-6f;
+    for (int t = 0; t < n; t++) if (steps[t].importance > max_imp) max_imp = steps[t].importance;
+
+    for (int t = 0; t < n; t++) {
+        const TCGradStep *s = &steps[t];
+        int bar_len = (int)((s->importance / max_imp) * 30.0f);
+        if (bar_len > 30) bar_len = 30;
+        if (bar_len < 0) bar_len = 0;
+        printf("'%c'    %.6f     %.6f     ", printable(s->ch), s->importance, s->grad_norm);
+        for (int k = 0; k < bar_len; k++) putchar('#');
+        printf("\n");
+    }
+}
+
+int tc_explain_heads(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                     TCHeadImportance *out_heads) {
+    if (T < 2 || !out_heads) return 0;
+    int T_use = T - 1;
+    const int *targets = ids + 1;
+
+    float base_loss;
+    tc_forward(p, c, ids, T_use, targets, &base_loss);
+
+    int count = 0;
+    for (int l = 0; l < p->cfg.n_layers; l++) {
+        for (int h = 0; h < p->cfg.n_heads; h++) {
+            float ablated_loss;
+            tc_forward_ex(p, c, ids, T_use, targets, &ablated_loss, l, h);
+            out_heads[count].layer = l;
+            out_heads[count].head = h;
+            out_heads[count].importance = ablated_loss - base_loss;
+            count++;
+        }
+    }
+    return count;
 }

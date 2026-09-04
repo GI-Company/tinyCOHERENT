@@ -17,6 +17,9 @@
 
 #include <stddef.h>
 
+#define TC_MAX_D_MODEL 1024
+#define TC_MAX_FF_DIM  4096
+
 typedef struct {
     int vocab_size;   /* number of distinct token ids */
     int d_model;      /* hidden width D */
@@ -118,15 +121,46 @@ void tc_cache_free(TCCache *c);
 
 /* Forward pass over token ids[0..T-1]; fills cache (T <= cfg.max_seq_len).
  * If targets != NULL (next-token ids, length T), also computes mean
- * cross-entropy loss over all T positions and returns it via *out_loss. */
+ * cross-entropy loss over active positions (targets[t] >= 0) and returns it via *out_loss.
+ * Masked positions (targets[t] < 0) are excluded from the loss and normalization. */
 void tc_forward(const TCParamSet *p, TCCache *c, const int *ids, int T,
                  const int *targets, float *out_loss);
 
+/* Latent activation steering configuration */
+typedef struct {
+    int layer;        /* target layer index (0 <= layer < n_layers), or -1 for disabled */
+    float alpha;      /* steering multiplier (+/-) */
+    const float *vec; /* D-dimensional normalized direction vector (or NULL) */
+} TCSteerConfig;
+
+/* Forward pass with optional single-head ablation (for mechanistic interpretability).
+ * If ablate_layer >= 0 and ablate_head >= 0, that head's attention output is zeroed. */
+void tc_forward_ex(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                   const int *targets, float *out_loss, int ablate_layer, int ablate_head);
+
+/* Forward pass with latent activation steering. Injects alpha * vec into the residual
+ * stream at the output of the specified layer. If steer == NULL or steer->layer < 0,
+ * standard unsteered forward pass is performed. */
+void tc_forward_steered(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                        const int *targets, float *out_loss, const TCSteerConfig *steer);
+
 /* Backward pass: requires targets to have been passed to tc_forward
  * (uses cache->probs and targets to seed dLogits). Accumulates gradients
- * into grad (caller should zero it first for a fresh accumulation). */
+ * into grad (caller should zero it first for a fresh accumulation).
+ * Supports masked targets (targets[t] < 0): masked tokens produce zero dLogits. */
 void tc_backward(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
                    const int *ids, int T, const int *targets);
+
+/* Extended backward: allows capturing input embedding gradients out_dx0 (T x d_model floats,
+ * or NULL). If grad is NULL, parameter gradient accumulation is skipped. */
+void tc_backward_ex(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
+                    const int *ids, int T, const int *targets, float *out_dx0);
+
+/* Analytical input gradient: computes d(loss)/d(x0) where x0 is the input embedding
+ * representation (T x d_model floats) in a single backward pass without parameter updates.
+ * out_dx0 must hold at least T * d_model floats. */
+void tc_input_grad(const TCParamSet *p, const TCCache *c,
+                   const int *ids, int T, const int *targets, float *out_dx0);
 
 int tc_param_count(TCConfig cfg);
 
