@@ -24,7 +24,8 @@ typedef struct {
     int vocab_size;   /* number of distinct token ids */
     int d_model;      /* hidden width D */
     int n_layers;     /* number of hybrid blocks */
-    int n_heads;      /* attention heads, must divide d_model */
+    int n_heads;      /* query attention heads, must divide d_model */
+    int n_kv_heads;   /* kv attention heads, must divide n_heads */
     int ff_mult;      /* channel-mix hidden expansion ratio */
     int max_seq_len;  /* activation buffer capacity (chunk length cap) */
 } TCConfig;
@@ -32,20 +33,20 @@ typedef struct {
 TCConfig tc_default_config(void);
 
 typedef struct {
-    float *ln1_gamma, *ln1_beta;
+    float *ln1_gamma;
     float *tm_mix_k, *tm_mix_v, *tm_mix_r; /* token-shift interpolation logits */
     float *tm_Wk, *tm_Wv, *tm_Wr;          /* D x D */
     float *tm_decay;                        /* per-channel decay logit, D */
     float *tm_Wo;                           /* D x D */
 
-    float *ln2_gamma, *ln2_beta;
-    float *at_Wq, *at_Wk, *at_Wv, *at_Wo;  /* D x D */
+    float *ln2_gamma;
+    float *at_Wq, *at_Wk, *at_Wv, *at_Wo;  /* at_Wk and at_Wv are (D * n_kv_heads / n_heads) x D */
 
-    float *ln3_gamma, *ln3_beta;
-    float *cm_mix_k, *cm_mix_r;
-    float *cm_Wk;  /* D x (ff_mult*D) */
-    float *cm_Wv;  /* (ff_mult*D) x D */
-    float *cm_Wr;  /* D x D */
+    float *ln3_gamma;
+    float *cm_mix_gate, *cm_mix_up;
+    float *cm_Wgate; /* D x (ff_mult*D) */
+    float *cm_Wup;   /* D x (ff_mult*D) */
+    float *cm_Wdown; /* (ff_mult*D) x D */
 } TCLayerView;
 
 typedef struct {
@@ -54,8 +55,9 @@ typedef struct {
     int n_floats;
     float *embed;      /* vocab_size x d_model, tied with output head */
     float *ln_f_gamma; /* d_model */
-    float *ln_f_beta;  /* d_model */
     float *pool_w;     /* d_model, learned attention-pooling query (embedder head only) */
+    float *mtp_head1;  /* d_model x d_model, MTP projection for t+2 prediction */
+    float *mtp_head2;  /* d_model x d_model, MTP projection for t+3 prediction */
     TCLayerView *layers;
 } TCParamSet;
 
@@ -70,7 +72,7 @@ void tc_paramset_init_random(TCParamSet *ps, unsigned int seed);
 typedef struct {
     int T;
     float *x0;               /* T x D, block input */
-    float *ln1_mean, *ln1_rstd; /* T */
+    float *ln1_rms;           /* T, RMSNorm */
     float *ln1_out;           /* T x D */
     float *ln1_xhat;          /* T x D, normalized pre-affine (needed for LN backward) */
     float *xk, *xv, *xr;      /* T x D each, token-shift mixed */
@@ -80,22 +82,20 @@ typedef struct {
     float *tm_out;             /* T x D, after Wo */
     float *resid1;             /* T x D */
 
-    float *ln2_mean, *ln2_rstd;
+    float *ln2_rms;
     float *ln2_out;             /* T x D */
     float *ln2_xhat;             /* T x D */
-    float *Q, *K, *V;           /* T x D each */
+    float *Q, *K, *V;           /* Q is T x D. K, V are T x (D * n_kv_heads / n_heads) */
     float *attn_w;              /* n_heads x T x T (causal softmax weights) */
     float *attn_ctx;            /* T x D, pre-Wo attention output (concat heads) */
     float *attn_out;            /* T x D, after Wo */
     float *resid2;               /* T x D */
 
-    float *ln3_mean, *ln3_rstd;
+    float *ln3_rms;
     float *ln3_out;               /* T x D */
     float *ln3_xhat;               /* T x D */
-    float *cmxk, *cmxr;           /* T x D */
-    float *h_pre, *h_relu;        /* T x (ff_mult*D) */
-    float *cm_v;                   /* T x D */
-    float *r3_sig;                  /* T x D */
+    float *cmxgate, *cmxup;       /* T x D */
+    float *h_gate, *h_up, *h_silu;/* T x (ff_mult*D) */
     float *cm_out;                   /* T x D */
     float *resid3;                    /* T x D, block output */
 } TCLayerCache;
@@ -104,11 +104,17 @@ typedef struct {
     TCConfig cfg;
     int T;
     TCLayerCache *layers;   /* n_layers */
-    float *ln_f_mean, *ln_f_rstd; /* T */
+    float *ln_f_rms;        /* T */
     float *ln_f_out;                /* T x D */
     float *ln_f_xhat;                /* T x D */
     float *logits;                   /* T x vocab_size */
     float *probs;                     /* T x vocab_size, softmax(logits) */
+
+    /* MTP (multi-token prediction) caches */
+    float *mtp_h1;           /* T x D, post-projection hidden for t+2 head */
+    float *mtp_h2;           /* T x D, post-projection hidden for t+3 head */
+    float *mtp_probs1;       /* T x vocab_size, softmax for t+2 head */
+    float *mtp_probs2;       /* T x vocab_size, softmax for t+3 head */
 
     float *pool_scores;  /* T, raw attention-pool scores before softmax */
     float *pool_weights;  /* T, softmax(pool_scores) */
@@ -155,6 +161,39 @@ void tc_backward(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
  * or NULL). If grad is NULL, parameter gradient accumulation is skipped. */
 void tc_backward_ex(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
                     const int *ids, int T, const int *targets, float *out_dx0);
+
+/* Forward with contrastive (unlikelihood) loss.
+ * targets_neg[t] >= 0 means "penalize if model predicts this token at position t".
+ * targets_neg[t] < 0 means no unlikelihood penalty at this position.
+ * ul_weight scales the unlikelihood loss relative to the standard cross-entropy. */
+void tc_forward_ul(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                   const int *targets, const int *targets_neg, float ul_weight,
+                   float *out_loss);
+
+/* Backward with contrastive (unlikelihood) gradients.
+ * Computes both attractive (standard CE) and repulsive (unlikelihood) gradients
+ * and sums them before backpropagating through the encoder. */
+void tc_backward_ul(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
+                    const int *ids, int T, const int *targets,
+                    const int *targets_neg, float ul_weight);
+
+/* Multi-Token Prediction forward: runs standard forward, then projects
+ * ln_f_out through mtp_head1 and mtp_head2 (D×D) followed by tied embedding
+ * projection to produce independent logits/probs for t+2 and t+3.
+ * targets_t2[t] and targets_t3[t] are the ground-truth token IDs for
+ * positions t+2 and t+3 (set < 0 to mask). mtp_weight scales the auxiliary
+ * losses. Total loss = standard_CE + mtp_weight * (CE_t2 + CE_t3). */
+void tc_forward_mtp(const TCParamSet *p, TCCache *c, const int *ids, int T,
+                    const int *targets, const int *targets_t2, const int *targets_t3,
+                    float mtp_weight, float *out_loss);
+
+/* Multi-Token Prediction backward: backpropagates gradients from all three
+ * prediction heads (t+1, t+2, t+3) through their respective projection
+ * matrices and sums them at ln_f_out before driving tc_encode_backward. */
+void tc_backward_mtp(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
+                     const int *ids, int T, const int *targets,
+                     const int *targets_t2, const int *targets_t3,
+                     float mtp_weight);
 
 /* Analytical input gradient: computes d(loss)/d(x0) where x0 is the input embedding
  * representation (T x d_model floats) in a single backward pass without parameter updates.

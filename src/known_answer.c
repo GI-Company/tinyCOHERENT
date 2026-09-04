@@ -72,7 +72,7 @@ int main(void) {
     tc_paramset_init_random(p, 555);
     TCParamSet *grad = tc_paramset_create(cfg);
     TCCache *cache = tc_cache_create(cfg);
-    TCAdam *adam = tc_adam_create(cfg, 5e-3f);
+    TCAdam *adam = tc_adam_create(cfg, 5e-3f, 0.0f);
 
     unsigned int train_rng = 1;
     unsigned int eval_rng = 999999; /* disjoint stream from training */

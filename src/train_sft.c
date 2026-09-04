@@ -163,7 +163,7 @@ int main(int argc, char **argv) {
     }
 
     /* Setup optimizer and worker caches */
-    TCAdam *adam = tc_adam_create(cfg, base_lr);
+    TCAdam *adam = tc_adam_create(cfg, base_lr, 0.0f);
 
     TCParamSet *grads[16];
     TCCache *caches[16];

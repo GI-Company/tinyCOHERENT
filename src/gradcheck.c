@@ -15,7 +15,7 @@ static float run_loss(const TCParamSet *p, TCCache *c, const int *ids, int T, co
 }
 
 int main(void) {
-    TCConfig cfg;
+    TCConfig cfg = tc_default_config();
     cfg.vocab_size = 16;
     cfg.d_model = 8;
     cfg.n_layers = 2;

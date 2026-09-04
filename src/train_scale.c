@@ -73,6 +73,9 @@ int main(int argc, char **argv) {
     float base_lr = 2.0e-3f;
     float min_lr = 1e-4f;
     const char *resume_path = NULL;
+    int accum_steps = 1;  /* gradient accumulation steps */
+    float mtp_weight = 0.0f; /* multi-token prediction weight (0 = disabled) */
+    float ponder_rate = 0.0f; /* fraction of tokens replaced with ponder token */
 
     int has_flag = 0;
     for (int i = 1; i < argc; i++) {
@@ -126,6 +129,13 @@ int main(int argc, char **argv) {
                 resume_path = model_path;
                 if (base_lr == 2.0e-3f) base_lr = 8.0e-4f;
                 min_lr = 5.0e-5f;
+            } else if (strcmp(argv[i], "--accum") == 0 && i + 1 < argc) {
+                accum_steps = atoi(argv[++i]);
+                if (accum_steps < 1) accum_steps = 1;
+            } else if (strcmp(argv[i], "--mtp") == 0 && i + 1 < argc) {
+                mtp_weight = (float)atof(argv[++i]);
+            } else if (strcmp(argv[i], "--ponder") == 0 && i + 1 < argc) {
+                ponder_rate = (float)atof(argv[++i]);
             }
         }
     }
@@ -164,7 +174,13 @@ int main(int argc, char **argv) {
     const int *val_tokens = tokens + split_at;
     printf("split: %ld train tokens / %ld val tokens (held out, never trained on)\n", train_len, val_len);
 
-    TCConfig cfg;
+    int ponder_token_id = vocab_size;
+    if (ponder_rate > 0.0f) {
+        vocab_size++;
+        printf("Ponder token enabled: rate=%.2f, id=%d\n", ponder_rate, ponder_token_id);
+    }
+
+    TCConfig cfg = tc_default_config();
     cfg.vocab_size = vocab_size;
     cfg.d_model = arg_d_model;
     cfg.n_layers = arg_n_layers;
@@ -173,8 +189,8 @@ int main(int argc, char **argv) {
     cfg.ff_mult = 2;
     cfg.max_seq_len = 128;
 
-    printf("config: vocab=%d d_model=%d n_layers=%d n_heads=%d ff_mult=%d max_seq_len=%d\n",
-           cfg.vocab_size, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.ff_mult, cfg.max_seq_len);
+    printf("config: vocab=%d d_model=%d n_layers=%d n_heads=%d n_kv_heads=%d ff_mult=%d max_seq_len=%d\n",
+           cfg.vocab_size, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.ff_mult, cfg.max_seq_len);
     int pcount = tc_param_count(cfg);
     printf("param count = %d (%.2fM parameters)\n", pcount, pcount / 1e6);
 
@@ -194,9 +210,13 @@ int main(int argc, char **argv) {
         p = tc_paramset_create(cfg);
         tc_paramset_init_random(p, 1234);
     }
-    TCAdam *adam = tc_adam_create(cfg, base_lr);
+    TCAdam *adam = tc_adam_create(cfg, base_lr, 0.01f);
 
     int batch_size = 8;
+    if (accum_steps > 1)
+        printf("gradient accumulation: %d steps (effective batch = %d)\n", accum_steps, batch_size * accum_steps);
+    if (mtp_weight > 0.0f)
+        printf("multi-token prediction: weight=%.2f (t+2, t+3 auxiliary losses)\n", mtp_weight);
     int report_every = (num_steps >= 2000) ? 100 : (num_steps >= 200 ? 25 : 10);
     int checkpoint_every = (num_steps >= 1000) ? 500 : 50;
 
@@ -222,54 +242,113 @@ int main(int argc, char **argv) {
     float *losses_ptr = batch_losses;
 
     for (int step = 1; step <= num_steps; step++) {
-#ifdef __APPLE__
-        dispatch_apply(batch_size, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(size_t b) {
-            tc_paramset_zero(grads_ptr[b]);
-            long max_off = train_len - chunk_len - 1;
-            long off = ((long)rand_r(&seeds_ptr[b])) % max_off;
-            const int *ids = train_tokens + off;
-            const int *targets = train_tokens + off + 1;
-            float loss;
-            tc_forward(p, caches_ptr[b], ids, chunk_len, targets, &loss);
-            tc_backward(p, grads_ptr[b], caches_ptr[b], ids, chunk_len, targets);
-            losses_ptr[b] = loss;
-        });
-
+        /* --- gradient accumulation outer loop --- */
         float step_loss = 0.0f;
-        for (int b = 0; b < batch_size; b++) {
-            step_loss += batch_losses[b];
-            if (b > 0) {
+        tc_paramset_zero(grads[0]);
+        for (int accum = 0; accum < accum_steps; accum++) {
+#ifdef __APPLE__
+            /* Each accum step runs a full parallel micro-batch */
+            for (int b = 0; b < batch_size; b++) tc_paramset_zero(grads_ptr[b]);
+            dispatch_apply(batch_size, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(size_t b) {
+                long max_off = train_len - chunk_len - 3; /* -3 to allow MTP t+2, t+3 targets */
+                if (max_off < 1) max_off = 1;
+                long off = ((long)rand_r(&seeds_ptr[b])) % max_off;
+                
+                int local_ids[1024], local_targets[1024], local_t2[1024], local_t3[1024];
+                for (int i = 0; i < chunk_len; i++) {
+                    local_ids[i] = train_tokens[off + i];
+                }
+
+                if (ponder_rate > 0.0f && ((float)(rand_r(&seeds_ptr[b]) % 10000) / 10000.0f) < ponder_rate) {
+                    int pos = rand_r(&seeds_ptr[b]) % (chunk_len - 1);
+                    for (int i = chunk_len - 1; i > pos; i--) local_ids[i] = local_ids[i - 1];
+                    local_ids[pos] = ponder_token_id;
+                }
+
+                for (int i = 0; i < chunk_len; i++) {
+                    local_targets[i] = (i + 1 < chunk_len) ? local_ids[i + 1] : train_tokens[off + chunk_len];
+                    local_t2[i] = (i + 2 < chunk_len) ? local_ids[i + 2] : train_tokens[off + chunk_len + 1];
+                    local_t3[i] = (i + 3 < chunk_len) ? local_ids[i + 3] : train_tokens[off + chunk_len + 2];
+                }
+
+                const int *ids = local_ids;
+                const int *targets = local_targets;
+                const int *targets_t2 = local_t2;
+                const int *targets_t3 = local_t3;
+                float loss;
+
+                if (mtp_weight > 0.0f) {
+                    tc_forward_mtp(p, caches_ptr[b], ids, chunk_len, targets, targets_t2, targets_t3, mtp_weight, &loss);
+                    tc_backward_mtp(p, grads_ptr[b], caches_ptr[b], ids, chunk_len, targets, targets_t2, targets_t3, mtp_weight);
+                } else {
+                    tc_forward(p, caches_ptr[b], ids, chunk_len, targets, &loss);
+                    tc_backward(p, grads_ptr[b], caches_ptr[b], ids, chunk_len, targets);
+                }
+                losses_ptr[b] = loss;
+            });
+
+            for (int b = 0; b < batch_size; b++) {
+                step_loss += batch_losses[b];
+                if (accum == 0 && b == 0) continue; /* grads[0] already has its own batch */
                 for (int i = 0; i < p->n_floats; i++) grads[0]->buf[i] += grads[b]->buf[i];
             }
-        }
 #else
-        tc_paramset_zero(grads[0]);
-        float step_loss = 0.0f;
-        for (int b = 0; b < batch_size; b++) {
-            long max_off = train_len - chunk_len - 1;
-            long off = rand() % max_off;
-            const int *ids = train_tokens + off;
-            const int *targets = train_tokens + off + 1;
-            float loss;
-            tc_forward(p, caches[0], ids, chunk_len, targets, &loss);
-            tc_backward(p, grads[0], caches[0], ids, chunk_len, targets);
-            step_loss += loss;
-        }
+            float micro_loss = 0.0f;
+            for (int b = 0; b < batch_size; b++) {
+                long max_off = train_len - chunk_len - 3;
+                if (max_off < 1) max_off = 1;
+                long off = rand() % max_off;
+
+                int local_ids[1024], local_targets[1024], local_t2[1024], local_t3[1024];
+                for (int i = 0; i < chunk_len; i++) {
+                    local_ids[i] = train_tokens[off + i];
+                }
+
+                if (ponder_rate > 0.0f && ((float)(rand() % 10000) / 10000.0f) < ponder_rate) {
+                    int pos = rand() % (chunk_len - 1);
+                    for (int i = chunk_len - 1; i > pos; i--) local_ids[i] = local_ids[i - 1];
+                    local_ids[pos] = ponder_token_id;
+                }
+
+                for (int i = 0; i < chunk_len; i++) {
+                    local_targets[i] = (i + 1 < chunk_len) ? local_ids[i + 1] : train_tokens[off + chunk_len];
+                    local_t2[i] = (i + 2 < chunk_len) ? local_ids[i + 2] : train_tokens[off + chunk_len + 1];
+                    local_t3[i] = (i + 3 < chunk_len) ? local_ids[i + 3] : train_tokens[off + chunk_len + 2];
+                }
+
+                const int *ids = local_ids;
+                const int *targets = local_targets;
+                const int *targets_t2 = local_t2;
+                const int *targets_t3 = local_t3;
+                float loss;
+
+                if (mtp_weight > 0.0f) {
+                    tc_forward_mtp(p, caches[0], ids, chunk_len, targets, targets_t2, targets_t3, mtp_weight, &loss);
+                    tc_backward_mtp(p, grads[0], caches[0], ids, chunk_len, targets, targets_t2, targets_t3, mtp_weight);
+                } else {
+                    tc_forward(p, caches[0], ids, chunk_len, targets, &loss);
+                    tc_backward(p, grads[0], caches[0], ids, chunk_len, targets);
+                }
+                micro_loss += loss;
+            }
+            step_loss += micro_loss;
 #endif
-        scale_grad(grads[0], 1.0f / (float)batch_size);
+        } /* end accum loop */
+        float total_microbatches = (float)(batch_size * accum_steps);
+        scale_grad(grads[0], 1.0f / total_microbatches);
 
         /* Cosine learning rate schedule */
         float progress = (float)step / (float)num_steps;
         adam->lr = min_lr + 0.5f * (base_lr - min_lr) * (1.0f + cosf(3.14159265f * progress));
 
         tc_adam_step(adam, p, grads[0]);
-        step_loss /= (float)batch_size;
+        step_loss /= total_microbatches;
         running_loss = (step == 1) ? step_loss : 0.98f * running_loss + 0.02f * step_loss;
 
         if (step % report_every == 0 || step == 1) {
             float val_loss = eval_val_loss(p, caches[0], val_tokens, val_len, chunk_len);
             double secs = get_time_sec() - t0;
-            double tok_per_sec = (double)(step * batch_size * chunk_len) / (secs > 0 ? secs : 1.0);
+            double tok_per_sec = (double)(step * (int)total_microbatches * chunk_len) / (secs > 0 ? secs : 1.0);
             printf("step %6d  lr %.6f  train_loss %.4f (avg %.4f)  val_loss %.4f  [%.1fs | %.0f tok/s]\n",
                    step, adam->lr, step_loss, running_loss, val_loss, secs, tok_per_sec);
         }

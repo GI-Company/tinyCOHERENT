@@ -7,10 +7,10 @@ typedef struct {
     TCParamSet *m;
     TCParamSet *v;
     int t;
-    float lr, beta1, beta2, eps;
+    float lr, beta1, beta2, eps, wd;
 } TCAdam;
 
-TCAdam *tc_adam_create(TCConfig cfg, float lr);
+TCAdam *tc_adam_create(TCConfig cfg, float lr, float wd);
 void tc_adam_free(TCAdam *a);
 /* Applies one Adam step: params -= update, using grad (already accumulated
  * by the caller, e.g. mean over a batch), then zeroes grad for reuse. */

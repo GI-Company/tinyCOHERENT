@@ -20,14 +20,14 @@ echo "=== Running $STEPS steps from $IN_MODEL -> $OUT_MODEL ==="
 ./build/train_scale --resume "$IN_MODEL" --out "$OUT_MODEL" --steps "$STEPS"
 
 echo "=== Extracting Validation Loss ==="
-VAL_OUT=$(./scratch/eval_frozen "$OUT_MODEL")
+VAL_OUT=$(./build/eval_frozen "$OUT_MODEL")
 VAL_LOSS=$(echo "$VAL_OUT" | awk '/Exact Validation Loss:/ {print $4}')
 
 echo "=== Running Faithcheck ==="
 FAITH_OUT=$(./build/faithcheck "$OUT_MODEL" - --csv)
 
 echo "=== Generating Samples and Hashing ==="
-SAMPLE_OUT=$(./scratch/official_samples "$OUT_MODEL")
+SAMPLE_OUT=$(./build/official_samples "$OUT_MODEL")
 SAMPLE_HASH=$(echo "$SAMPLE_OUT" | shasum -a 256 | awk '{print $1}')
 
 echo "=== Appending to Ledger ==="

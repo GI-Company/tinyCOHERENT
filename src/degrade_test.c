@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
     tc_paramset_init_random(p, init_seed);
     TCParamSet *grad = tc_paramset_create(cfg);
     TCCache *cache = tc_cache_create(cfg);
-    TCAdam *adam = tc_adam_create(cfg, 5e-3f);
+    TCAdam *adam = tc_adam_create(cfg, 5e-3f, 0.0f);
 
     unsigned int train_rng = seed == 0 ? 1u : (seed * 104729u + 13u);
     unsigned int eval_rng = seed == 0 ? 999999u : (seed * 15485863u + 29u);

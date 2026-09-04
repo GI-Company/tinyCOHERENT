@@ -84,7 +84,7 @@ int main(int argc, char **argv) {
     tc_paramset_init_random(p, 1234);
     TCParamSet *grad = tc_paramset_create(cfg);
     TCCache *cache = tc_cache_create(cfg);
-    TCAdam *adam = tc_adam_create(cfg, 5e-3f);
+    TCAdam *adam = tc_adam_create(cfg, 5e-3f, 0.0f);
 
     int chunk_len = 48, batch_size = 4, num_steps = 3000, report_every = 200;
     srand(7);

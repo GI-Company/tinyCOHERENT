@@ -1,1 +1,2 @@
 block_end_model,val_loss,del_k1,del_k2,del_k3,del_k5,avg_del,rand_corr,sample_hash
+build/model_rung6_step1900.bin,1.8598,0.4484,1.0447,1.6366,2.6735,1.4508,0.1492,5e677ac540a2cc8737815cd005a41d262cbd767762b27f5aff389c5f5fc8c1f2

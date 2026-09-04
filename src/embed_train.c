@@ -333,7 +333,7 @@ int main(int argc, char **argv) {
         printf("SELF-CHECK PASS -- proceeding to train\n\n");
     }
 
-    TCAdam *adam = tc_adam_create(cfg, 3e-3f);
+    TCAdam *adam = tc_adam_create(cfg, 3e-3f, 0.0f);
     int num_steps = 4000, report_every = 400;
     float running = -1.0f;
     clock_t t0 = clock();

@@ -11,7 +11,7 @@ BUILD = build
 
 .PHONY: all gradcheck embed_gradcheck train train_scale train_rung6 train_rung6_continue embed_train dag embed rag faithcheck faithcheck_rung4 faithcheck_rung6 known_answer chat chat_rung6 clean
 
-all: $(BUILD)/gradcheck $(BUILD)/embed_gradcheck $(BUILD)/train $(BUILD)/train_scale $(BUILD)/embed_train $(BUILD)/dag_demo $(BUILD)/embed_demo $(BUILD)/rag_demo $(BUILD)/faithcheck $(BUILD)/known_answer $(BUILD)/chat $(BUILD)/server
+all: $(BUILD)/gradcheck $(BUILD)/embed_gradcheck $(BUILD)/train $(BUILD)/train_scale $(BUILD)/embed_train $(BUILD)/dag_demo $(BUILD)/embed_demo $(BUILD)/rag_demo $(BUILD)/faithcheck $(BUILD)/known_answer $(BUILD)/chat $(BUILD)/server $(BUILD)/eval_frozen $(BUILD)/official_samples
 
 $(BUILD)/gradcheck: $(SRC) src/gradcheck.c
 	$(CC) $(CFLAGS) -o $@ $(SRC) src/gradcheck.c $(LDLIBS)
@@ -39,6 +39,12 @@ $(BUILD)/known_answer: $(SRC) src/glassbox.c src/known_answer.c
 
 $(BUILD)/degrade_test: $(SRC) src/glassbox.c src/degrade_test.c
 	$(CC) $(CFLAGS) -o $@ $(SRC) src/glassbox.c src/degrade_test.c $(LDLIBS)
+
+$(BUILD)/eval_frozen: $(SRC) src/glassbox.c src/bpe.c src/eval_frozen.c
+	$(CC) $(CFLAGS) -o $@ $(SRC) src/glassbox.c src/bpe.c src/eval_frozen.c $(LDLIBS)
+
+$(BUILD)/official_samples: $(SRC) src/glassbox.c src/bpe.c src/official_samples.c
+	$(CC) $(CFLAGS) -o $@ $(SRC) src/glassbox.c src/bpe.c src/official_samples.c $(LDLIBS)
 
 $(BUILD)/chat: $(SRC) src/glassbox.c src/bpe.c src/vectorstore.c src/steer.c src/chat.c
 	$(CC) $(CFLAGS) -o $@ $(SRC) src/glassbox.c src/bpe.c src/vectorstore.c src/steer.c src/chat.c $(LDLIBS)
