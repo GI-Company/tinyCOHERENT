@@ -14,6 +14,9 @@
 /* Several hot loops use fixed-size stack buffers sized for models
  * up to D=1024, FF=4096 instead of alloca/VLA. */
 static void tc_config_check(TCConfig cfg) {
+    if (cfg.max_seq_len <= 0 || cfg.max_seq_len > 4096) {
+        printf("tc_config_check FAILED: max_seq_len=%d, d_model=%d, n_layers=%d\n", cfg.max_seq_len, cfg.d_model, cfg.n_layers);
+    }
     assert(cfg.d_model > 0 && cfg.d_model <= TC_MAX_D_MODEL);
     assert(cfg.ff_mult > 0 && cfg.ff_mult * cfg.d_model <= TC_MAX_FF_DIM);
     assert(cfg.max_seq_len > 0 && cfg.max_seq_len <= 4096);
@@ -92,7 +95,8 @@ TCParamSet *tc_paramset_create(TCConfig cfg) {
     ps->layers = calloc(cfg.n_layers, sizeof(TCLayerView));
     int n = layout_all(ps, NULL, cfg);
     ps->n_floats = n;
-    ps->buf = calloc((size_t)n, sizeof(float));
+    posix_memalign((void**)&ps->buf, 16384, (size_t)n * sizeof(float));
+    memset(ps->buf, 0, (size_t)n * sizeof(float));
     layout_all(ps, ps->buf, cfg);
     return ps;
 }
@@ -179,6 +183,7 @@ TCParamSet *tc_paramset_load(const char *path) {
     if (!f) return NULL;
     TCConfig cfg;
     if (fread(&cfg, sizeof(TCConfig), 1, f) != 1) { fclose(f); return NULL; }
+    if (cfg.max_seq_len <= 0 || cfg.max_seq_len > 4096) cfg.max_seq_len = 128;
     TCParamSet *ps = tc_paramset_create(cfg);
     size_t n = fread(ps->buf, sizeof(float), (size_t)ps->n_floats, f);
     fclose(f);
@@ -190,89 +195,62 @@ TCParamSet *tc_paramset_load(const char *path) {
  * Cache allocation (mirrors the shapes used in forward/backward).
  * ------------------------------------------------------------------- */
 
+static int layout_cache_layer(TCLayerCache *lc, float *buf, int off, TCConfig cfg) {
+    int D = cfg.d_model, T = cfg.max_seq_len;
+    int FF = cfg.ff_mult * D;
+    int kv_D = (D / cfg.n_heads) * cfg.n_kv_heads;
+#define TAKE(field, n) do { lc->field = buf ? buf + off : NULL; off += (n); } while (0)
+    TAKE(x0, T * D);
+    TAKE(ln1_rms, T); TAKE(ln1_out, T * D); TAKE(ln1_xhat, T * D);
+    TAKE(xk, T * D); TAKE(xv, T * D); TAKE(xr, T * D);
+    TAKE(k, T * D); TAKE(v, T * D); TAKE(r_sig, T * D);
+    TAKE(state, T * D); TAKE(wkv, T * D); TAKE(tm_out, T * D); TAKE(resid1, T * D);
+
+    TAKE(ln2_rms, T); TAKE(ln2_out, T * D); TAKE(ln2_xhat, T * D);
+    TAKE(Q, T * D); TAKE(K, T * kv_D); TAKE(V, T * kv_D);
+    TAKE(attn_w, cfg.n_heads * T * T);
+    TAKE(attn_ctx, T * D); TAKE(attn_out, T * D); TAKE(resid2, T * D);
+
+    TAKE(ln3_rms, T); TAKE(ln3_out, T * D); TAKE(ln3_xhat, T * D);
+    TAKE(cmxgate, T * D); TAKE(cmxup, T * D);
+    TAKE(h_gate, T * FF); TAKE(h_up, T * FF); TAKE(h_silu, T * FF);
+    TAKE(cm_out, T * D); TAKE(resid3, T * D);
+#undef TAKE
+    return off;
+}
+
+static int layout_cache_all(TCCache *c, float *buf, TCConfig cfg) {
+    int off = 0;
+    int D = cfg.d_model, T = cfg.max_seq_len, V = cfg.vocab_size;
+#define TAKE(field, n) do { c->field = buf ? buf + off : NULL; off += (n); } while (0)
+    TAKE(ln_f_rms, T); TAKE(ln_f_out, T * D); TAKE(ln_f_xhat, T * D);
+    TAKE(logits, T * V); TAKE(probs, T * V);
+    TAKE(mtp_h1, T * D); TAKE(mtp_h2, T * D);
+    TAKE(mtp_probs1, T * V); TAKE(mtp_probs2, T * V);
+    TAKE(pool_scores, T); TAKE(pool_weights, T); TAKE(pool_raw, D);
+#undef TAKE
+    for (int l = 0; l < cfg.n_layers; l++)
+        off = layout_cache_layer(&c->layers[l], buf, off, cfg);
+    return off;
+}
+
 TCCache *tc_cache_create(TCConfig cfg) {
     TCCache *c = calloc(1, sizeof(TCCache));
     c->cfg = cfg;
-    int T = cfg.max_seq_len, D = cfg.d_model, V = cfg.vocab_size;
-    int FFD = cfg.ff_mult * D;
-    int kv_D = (D / cfg.n_heads) * cfg.n_kv_heads;
+    c->T = cfg.max_seq_len;
     c->layers = calloc(cfg.n_layers, sizeof(TCLayerCache));
-    for (int l = 0; l < cfg.n_layers; l++) {
-        TCLayerCache *lc = &c->layers[l];
-        lc->x0 = calloc((size_t)T * D, sizeof(float));
-        lc->ln1_rms = calloc(T, sizeof(float));
-        lc->ln1_out = calloc((size_t)T * D, sizeof(float));
-        lc->ln1_xhat = calloc((size_t)T * D, sizeof(float));
-        lc->xk = calloc((size_t)T * D, sizeof(float));
-        lc->xv = calloc((size_t)T * D, sizeof(float));
-        lc->xr = calloc((size_t)T * D, sizeof(float));
-        lc->k = calloc((size_t)T * D, sizeof(float));
-        lc->v = calloc((size_t)T * D, sizeof(float));
-        lc->r_sig = calloc((size_t)T * D, sizeof(float));
-        lc->state = calloc((size_t)T * D, sizeof(float));
-        lc->wkv = calloc((size_t)T * D, sizeof(float));
-        lc->tm_out = calloc((size_t)T * D, sizeof(float));
-        lc->resid1 = calloc((size_t)T * D, sizeof(float));
-
-        lc->ln2_rms = calloc(T, sizeof(float));
-        lc->ln2_out = calloc((size_t)T * D, sizeof(float));
-        lc->ln2_xhat = calloc((size_t)T * D, sizeof(float));
-        lc->Q = calloc((size_t)T * D, sizeof(float));
-        lc->K = calloc((size_t)T * kv_D, sizeof(float));
-        lc->V = calloc((size_t)T * kv_D, sizeof(float));
-        lc->attn_w = calloc((size_t)cfg.n_heads * T * T, sizeof(float));
-        lc->attn_ctx = calloc((size_t)T * D, sizeof(float));
-        lc->attn_out = calloc((size_t)T * D, sizeof(float));
-        lc->resid2 = calloc((size_t)T * D, sizeof(float));
-
-        lc->ln3_rms = calloc(T, sizeof(float));
-        lc->ln3_out = calloc((size_t)T * D, sizeof(float));
-        lc->ln3_xhat = calloc((size_t)T * D, sizeof(float));
-        lc->cmxgate = calloc((size_t)T * D, sizeof(float));
-        lc->cmxup = calloc((size_t)T * D, sizeof(float));
-        lc->h_gate = calloc((size_t)T * FFD, sizeof(float));
-        lc->h_up = calloc((size_t)T * FFD, sizeof(float));
-        lc->h_silu = calloc((size_t)T * FFD, sizeof(float));
-        lc->cm_out = calloc((size_t)T * D, sizeof(float));
-        lc->resid3 = calloc((size_t)T * D, sizeof(float));
-    }
-    c->ln_f_rms = calloc(T, sizeof(float));
-    c->ln_f_out = calloc((size_t)T * D, sizeof(float));
-    c->ln_f_xhat = calloc((size_t)T * D, sizeof(float));
-    c->logits = calloc((size_t)T * V, sizeof(float));
-    c->probs = calloc((size_t)T * V, sizeof(float));
-    c->mtp_h1 = calloc((size_t)T * D, sizeof(float));
-    c->mtp_h2 = calloc((size_t)T * D, sizeof(float));
-    c->mtp_probs1 = calloc((size_t)T * V, sizeof(float));
-    c->mtp_probs2 = calloc((size_t)T * V, sizeof(float));
-    c->pool_scores = calloc(T, sizeof(float));
-    c->pool_weights = calloc(T, sizeof(float));
-    c->pool_raw = calloc(D, sizeof(float));
+    int n = layout_cache_all(c, NULL, cfg);
+    c->n_floats = n;
+    posix_memalign((void**)&c->buf, 16384, (size_t)n * sizeof(float));
+    memset(c->buf, 0, (size_t)n * sizeof(float));
+    layout_cache_all(c, c->buf, cfg);
     return c;
 }
 
 void tc_cache_free(TCCache *c) {
     if (!c) return;
-    for (int l = 0; l < c->cfg.n_layers; l++) {
-        TCLayerCache *lc = &c->layers[l];
-        free(lc->x0); free(lc->ln1_rms); free(lc->ln1_out); free(lc->ln1_xhat);
-        free(lc->xk); free(lc->xv); free(lc->xr);
-        free(lc->k); free(lc->v); free(lc->r_sig);
-        free(lc->state); free(lc->wkv); free(lc->tm_out); free(lc->resid1);
-        free(lc->ln2_rms); free(lc->ln2_out); free(lc->ln2_xhat);
-        free(lc->Q); free(lc->K); free(lc->V);
-        free(lc->attn_w); free(lc->attn_ctx); free(lc->attn_out); free(lc->resid2);
-        free(lc->ln3_rms); free(lc->ln3_out); free(lc->ln3_xhat);
-        free(lc->cmxgate); free(lc->cmxup);
-        free(lc->h_gate); free(lc->h_up); free(lc->h_silu);
-        free(lc->cm_out); free(lc->resid3);
-    }
+    free(c->buf);
     free(c->layers);
-    free(c->ln_f_rms); free(c->ln_f_out); free(c->ln_f_xhat);
-    free(c->logits); free(c->probs);
-    free(c->mtp_h1); free(c->mtp_h2);
-    free(c->mtp_probs1); free(c->mtp_probs2);
-    free(c->pool_scores); free(c->pool_weights); free(c->pool_raw);
     free(c);
 }
 
@@ -282,80 +260,25 @@ void tc_cache_free(TCCache *c) {
 
 static inline float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 
+#include "tc_ops.h"
+
 /* y = W x, W row-major [out x in] */
 static void matvec(const float *W, const float *x, float *y, int out, int in) {
-#if defined(__APPLE__) && defined(ACCELERATE_NEW_LAPACK)
-    cblas_sgemv(CblasRowMajor, CblasNoTrans, out, in, 1.0f, W, in, x, 1, 0.0f, y, 1);
-#else
-    for (int o = 0; o < out; o++) {
-        float s = 0.0f;
-        const float *row = W + (size_t)o * in;
-        for (int i = 0; i < in; i++) s += row[i] * x[i];
-        y[o] = s;
-    }
-#endif
+    tc_gemv(y, W, x, out, in);
 }
 
 /* Accumulates dW += dy (x) x^T, dx += W^T dy. dx must already hold valid
  * data to accumulate into (caller zeroes once per position). */
 static void matvec_backward(const float *W, float *dW, const float *x, float *dx,
                              const float *dy, int out, int in) {
-#if defined(__APPLE__) && defined(ACCELERATE_NEW_LAPACK)
     if (dW) {
-        cblas_sger(CblasRowMajor, out, in, 1.0f, dy, 1, x, 1, dW, in);
+        tc_ger(dW, x, dy, out, in, 1.0f);
     }
     if (dx) {
-        cblas_sgemv(CblasRowMajor, CblasTrans, out, in, 1.0f, W, in, dy, 1, 1.0f, dx, 1);
-    }
-#else
-    for (int o = 0; o < out; o++) {
-        float dyo = dy[o];
-        const float *row = W + (size_t)o * in;
-        if (dW) {
-            float *drow = dW + (size_t)o * in;
-            for (int i = 0; i < in; i++) {
-                drow[i] += dyo * x[i];
-            }
-        }
-        if (dx) {
-            for (int i = 0; i < in; i++) {
-                dx[i] += row[i] * dyo;
-            }
-        }
-    }
-#endif
-}
-
-static void rmsnorm_forward(const float *x, const float *gamma, int D,
-                            float *rms_out, float *xhat_out, float *y_out) {
-    float var = 0.0f;
-    for (int i = 0; i < D; i++) var += x[i] * x[i];
-    var /= D;
-    float rms = 1.0f / sqrtf(var + LN_EPS);
-    *rms_out = rms;
-    for (int i = 0; i < D; i++) {
-        float xhat = x[i] * rms;
-        xhat_out[i] = xhat;
-        y_out[i] = gamma[i] * xhat;
+        tc_gemv_t_add(dx, W, dy, out, in);
     }
 }
 
-/* dx accumulated (+=), dgamma accumulated (+=). */
-static void rmsnorm_backward(const float *dy, const float *xhat, const float *gamma,
-                             float rms, int D, float *dgamma, float *dx) {
-    float sum2 = 0.0f;
-    float dxhat[TC_MAX_D_MODEL];
-    for (int i = 0; i < D; i++) {
-        if (dgamma) dgamma[i] += dy[i] * xhat[i];
-        dxhat[i] = dy[i] * gamma[i];
-        sum2 += dxhat[i] * xhat[i];
-    }
-    if (dx) {
-        for (int i = 0; i < D; i++) {
-            dx[i] += rms * (dxhat[i] - xhat[i] * sum2 / D);
-        }
-    }
-}
 
 static void rope_forward(float *q, float *k, int t, int D, int n_heads, int n_kv_heads) {
     int Dh = D / n_heads;
@@ -450,12 +373,7 @@ static void tc_encode_ex(const TCParamSet *p, TCCache *c, const int *ids, int T,
         memcpy(lc->x0, x, (size_t)T * D * sizeof(float));
 
         /* --- gated linear recurrence (time-mix) --- */
-        for (int t = 0; t < T; t++) {
-            const float *xt = x + (size_t)t * D;
-            rmsnorm_forward(xt, lv->ln1_gamma, D,
-                       &lc->ln1_rms[t],
-                       lc->ln1_xhat + (size_t)t * D, lc->ln1_out + (size_t)t * D);
-        }
+        tc_rmsnorm_fwd(x, lv->ln1_gamma, lc->ln1_rms, lc->ln1_xhat, lc->ln1_out, T, D, LN_EPS);
         for (int t = 0; t < T; t++) {
             const float *cur = lc->ln1_out + (size_t)t * D;
             const float *prev = t > 0 ? lc->ln1_out + (size_t)(t - 1) * D : NULL;
@@ -469,82 +387,41 @@ static void tc_encode_ex(const TCParamSet *p, TCCache *c, const int *ids, int T,
                 xv[i] = mv * cur[i] + (1 - mv) * p_;
                 xr[i] = mr * cur[i] + (1 - mr) * p_;
             }
-            matvec(lv->tm_Wk, xk, lc->k + (size_t)t * D, D, D);
-            matvec(lv->tm_Wv, xv, lc->v + (size_t)t * D, D, D);
-            float rpre[TC_MAX_D_MODEL];
-            matvec(lv->tm_Wr, xr, rpre, D, D);
-            float *rs = lc->r_sig + (size_t)t * D;
-            for (int i = 0; i < D; i++) rs[i] = sigmoidf_(rpre[i]);
+        }
+        tc_gemm_nt(lc->k, lc->xk, lv->tm_Wk, T, D, D);
+        tc_gemm_nt(lc->v, lc->xv, lv->tm_Wv, T, D, D);
+        tc_gemm_nt(lc->r_sig, lc->xr, lv->tm_Wr, T, D, D);
+        for (int i = 0; i < T * D; i++) {
+            lc->r_sig[i] = sigmoidf_(lc->r_sig[i]);
+        }
+        
+        tc_wkv_fwd(lc->k, lc->v, lc->r_sig, lv->tm_decay, lc->state, lc->wkv, T, D);
 
-            float *st = lc->state + (size_t)t * D;
-            const float *stprev = t > 0 ? lc->state + (size_t)(t - 1) * D : NULL;
-            const float *kt = lc->k + (size_t)t * D, *vt = lc->v + (size_t)t * D;
-            for (int i = 0; i < D; i++) {
-                float decay = sigmoidf_(lv->tm_decay[i]);
-                float sp = stprev ? stprev[i] : 0.0f;
-                st[i] = decay * sp + (1 - decay) * (kt[i] * vt[i]);
-            }
-            float *wkv = lc->wkv + (size_t)t * D;
-            for (int i = 0; i < D; i++) wkv[i] = rs[i] * st[i];
-            matvec(lv->tm_Wo, wkv, lc->tm_out + (size_t)t * D, D, D);
-            for (int i = 0; i < D; i++)
-                lc->resid1[(size_t)t * D + i] = lc->x0[(size_t)t * D + i] + lc->tm_out[(size_t)t * D + i];
+        tc_gemm_nt(lc->tm_out, lc->wkv, lv->tm_Wo, T, D, D);
+        for (int i = 0; i < T * D; i++) {
+            lc->resid1[i] = lc->x0[i] + lc->tm_out[i];
         }
 
         /* --- tiny causal self-attention --- */
         int kv_D = (D / H) * cfg.n_kv_heads;
         int kv_Dh = D / H;
+        tc_rmsnorm_fwd(lc->resid1, lv->ln2_gamma, lc->ln2_rms, lc->ln2_xhat, lc->ln2_out, T, D, LN_EPS);
+        tc_gemm_nt(lc->Q, lc->ln2_out, lv->at_Wq, T, D, D);
+        tc_gemm_nt(lc->K, lc->ln2_out, lv->at_Wk, T, kv_D, D);
+        tc_gemm_nt(lc->V, lc->ln2_out, lv->at_Wv, T, kv_D, D);
         for (int t = 0; t < T; t++) {
-            const float *rt = lc->resid1 + (size_t)t * D;
-            rmsnorm_forward(rt, lv->ln2_gamma, D,
-                       &lc->ln2_rms[t], lc->ln2_xhat + (size_t)t * D, lc->ln2_out + (size_t)t * D);
-            matvec(lv->at_Wq, lc->ln2_out + (size_t)t * D, lc->Q + (size_t)t * D, D, D);
-            matvec(lv->at_Wk, lc->ln2_out + (size_t)t * D, lc->K + (size_t)t * kv_D, kv_D, D);
-            matvec(lv->at_Wv, lc->ln2_out + (size_t)t * D, lc->V + (size_t)t * kv_D, kv_D, D);
             rope_forward(lc->Q + (size_t)t * D, lc->K + (size_t)t * kv_D, t, D, H, cfg.n_kv_heads);
         }
 
-        for (int h = 0; h < H; h++) {
-            int kv_h = h / (H / cfg.n_kv_heads);
-            for (int t = 0; t < T; t++) {
-                float scores[4096];
-                float maxs = -1e30f;
-                for (int u = 0; u <= t; u++) {
-                    const float *qh = lc->Q + (size_t)t * D + h * Dh;
-                    const float *kh = lc->K + (size_t)u * kv_D + kv_h * kv_Dh;
-                    float s = 0.0f;
-                    for (int i = 0; i < Dh; i++) s += qh[i] * kh[i];
-                    s *= invsqrt_dh;
-                    scores[u] = s;
-                    if (s > maxs) maxs = s;
-                }
-                float sum = 0.0f;
-                for (int u = 0; u <= t; u++) { scores[u] = expf(scores[u] - maxs); sum += scores[u]; }
-                float *wrow = lc->attn_w + ((size_t)h * T + t) * T;
-                for (int u = 0; u <= t; u++) wrow[u] = scores[u] / sum;
-                float *ctx = lc->attn_ctx + (size_t)t * D + h * Dh;
-                for (int i = 0; i < Dh; i++) ctx[i] = 0.0f;
-                if (l != ablate_layer || h != ablate_head) {
-                    for (int u = 0; u <= t; u++) {
-                        const float *vh = lc->V + (size_t)u * kv_D + kv_h * kv_Dh;
-                        float w = wrow[u];
-                        for (int i = 0; i < Dh; i++) ctx[i] += w * vh[i];
-                    }
-                }
-            }
-        }
-        for (int t = 0; t < T; t++) {
-            matvec(lv->at_Wo, lc->attn_ctx + (size_t)t * D, lc->attn_out + (size_t)t * D, D, D);
-            for (int i = 0; i < D; i++)
-                lc->resid2[(size_t)t * D + i] = lc->resid1[(size_t)t * D + i] + lc->attn_out[(size_t)t * D + i];
+        tc_attn_fwd(lc->Q, lc->K, lc->V, lc->attn_w, lc->attn_ctx, T, D, H, cfg.n_kv_heads);
+
+        tc_gemm_nt(lc->attn_out, lc->attn_ctx, lv->at_Wo, T, D, D);
+        for (int i = 0; i < T * D; i++) {
+            lc->resid2[i] = lc->resid1[i] + lc->attn_out[i];
         }
 
         /* --- SwiGLU FFN --- */
-        for (int t = 0; t < T; t++) {
-            const float *rt = lc->resid2 + (size_t)t * D;
-            rmsnorm_forward(rt, lv->ln3_gamma, D,
-                       &lc->ln3_rms[t], lc->ln3_xhat + (size_t)t * D, lc->ln3_out + (size_t)t * D);
-        }
+        tc_rmsnorm_fwd(lc->resid2, lv->ln3_gamma, lc->ln3_rms, lc->ln3_xhat, lc->ln3_out, T, D, LN_EPS);
         for (int t = 0; t < T; t++) {
             const float *cur = lc->ln3_out + (size_t)t * D;
             const float *prev = t > 0 ? lc->ln3_out + (size_t)(t - 1) * D : NULL;
@@ -556,19 +433,13 @@ static void tc_encode_ex(const TCParamSet *p, TCCache *c, const int *ids, int T,
                 cmxgate[i] = mgate * cur[i] + (1 - mgate) * p_;
                 cmxup[i] = mup * cur[i] + (1 - mup) * p_;
             }
-            float *hgate = lc->h_gate + (size_t)t * FFD;
-            float *hup = lc->h_up + (size_t)t * FFD;
-            matvec(lv->cm_Wgate, cmxgate, hgate, FFD, D);
-            matvec(lv->cm_Wup, cmxup, hup, FFD, D);
-            float *hsilu = lc->h_silu + (size_t)t * FFD;
-            for (int i = 0; i < FFD; i++) {
-                float g = hgate[i];
-                float s = sigmoidf_(g);
-                hsilu[i] = (g * s) * hup[i];
-            }
-            matvec(lv->cm_Wdown, hsilu, lc->cm_out + (size_t)t * D, D, FFD);
-            for (int i = 0; i < D; i++)
-                lc->resid3[(size_t)t * D + i] = lc->resid2[(size_t)t * D + i] + lc->cm_out[(size_t)t * D + i];
+        }
+        tc_gemm_nt(lc->h_gate, lc->cmxgate, lv->cm_Wgate, T, FFD, D);
+        tc_gemm_nt(lc->h_up, lc->cmxup, lv->cm_Wup, T, FFD, D);
+        tc_swiglu_fwd(lc->h_gate, lc->h_up, lc->h_silu, T, FFD);
+        tc_gemm_nt(lc->cm_out, lc->h_silu, lv->cm_Wdown, T, D, FFD);
+        for (int i = 0; i < T * D; i++) {
+            lc->resid3[i] = lc->resid2[i] + lc->cm_out[i];
         }
 
         memcpy(x, lc->resid3, (size_t)T * D * sizeof(float));
@@ -590,11 +461,7 @@ static void tc_encode_ex(const TCParamSet *p, TCCache *c, const int *ids, int T,
     }
 
     /* --- final LN --- */
-    for (int t = 0; t < T; t++) {
-        rmsnorm_forward(x + (size_t)t * D, p->ln_f_gamma, D,
-                   &c->ln_f_rms[t],
-                   c->ln_f_xhat + (size_t)t * D, c->ln_f_out + (size_t)t * D);
-    }
+    tc_rmsnorm_fwd(x, p->ln_f_gamma, c->ln_f_rms, c->ln_f_xhat, c->ln_f_out, T, D, LN_EPS);
     free(x);
 }
 
@@ -612,19 +479,8 @@ void tc_forward_ex(const TCParamSet *p, TCCache *c, const int *ids, int T,
     for (int t = 0; t < T; t++) {
         float *logit = c->logits + (size_t)t * V;
         matvec(p->embed, c->ln_f_out + (size_t)t * D, logit, V, D);
-        float maxv = -1e30f;
-        for (int i = 0; i < V; i++) if (logit[i] > maxv) maxv = logit[i];
-        float sum = 0.0f;
-        float *prob = c->probs + (size_t)t * V;
-        for (int i = 0; i < V; i++) { prob[i] = expf(logit[i] - maxv); sum += prob[i]; }
-        for (int i = 0; i < V; i++) prob[i] /= sum;
-        if (targets && targets[t] >= 0) {
-            float pt = prob[targets[t]];
-            if (pt < 1e-9f) pt = 1e-9f;
-            total_loss += -logf(pt);
-            n_active++;
-        }
     }
+    tc_ce_fwd(c->logits, targets, c->probs, &total_loss, &n_active, T, V);
     if (targets && out_loss) *out_loss = n_active > 0 ? (total_loss / (float)n_active) : 0.0f;
 }
 
@@ -684,35 +540,23 @@ void tc_forward_mtp(const TCParamSet *p, TCCache *c, const int *ids, int T,
         float *h = h_bufs[head];
         float *probs_out = prob_bufs[head];
 
-        float mtp_loss = 0.0f;
-        int mtp_active = 0;
+        float *logits = malloc((size_t)T * V * sizeof(float));
         for (int t = 0; t < T; t++) {
             /* h[t] = ln_f_out[t] @ W^T (D×D) */
             matvec(W, c->ln_f_out + (size_t)t * D, h + (size_t)t * D, D, D);
 
             /* logits[t] = h[t] @ embed^T (V×D) */
-            float logit[4096];
+            float *logit = logits + (size_t)t * V;
             matvec(p->embed, h + (size_t)t * D, logit, V, D);
-
-            /* softmax */
-            float maxv = -1e30f;
-            for (int i = 0; i < V; i++) if (logit[i] > maxv) maxv = logit[i];
-            float sum = 0.0f;
-            float *prob = probs_out + (size_t)t * V;
-            for (int i = 0; i < V; i++) { prob[i] = expf(logit[i] - maxv); sum += prob[i]; }
-            for (int i = 0; i < V; i++) prob[i] /= sum;
-
-            /* CE loss */
-            int tgt = tgt_arrays[head][t];
-            if (tgt >= 0) {
-                float pt = prob[tgt];
-                if (pt < 1e-9f) pt = 1e-9f;
-                mtp_loss += -logf(pt);
-                mtp_active++;
-            }
         }
+
+        float mtp_loss = 0.0f;
+        int mtp_active = 0;
+        tc_ce_fwd(logits, tgt_arrays[head], prob_bufs[head], &mtp_loss, &mtp_active, T, V);
+
         if (mtp_active > 0)
             *out_loss += mtp_weight * mtp_loss / (float)mtp_active;
+        free(logits);
     }
 }
 
@@ -726,19 +570,8 @@ void tc_forward_steered(const TCParamSet *p, TCCache *c, const int *ids, int T,
     for (int t = 0; t < T; t++) {
         float *logit = c->logits + (size_t)t * V;
         matvec(p->embed, c->ln_f_out + (size_t)t * D, logit, V, D);
-        float maxv = -1e30f;
-        for (int i = 0; i < V; i++) if (logit[i] > maxv) maxv = logit[i];
-        float sum = 0.0f;
-        float *prob = c->probs + (size_t)t * V;
-        for (int i = 0; i < V; i++) { prob[i] = expf(logit[i] - maxv); sum += prob[i]; }
-        for (int i = 0; i < V; i++) prob[i] /= sum;
-        if (targets && targets[t] >= 0) {
-            float pt = prob[targets[t]];
-            if (pt < 1e-9f) pt = 1e-9f;
-            total_loss += -logf(pt);
-            n_active++;
-        }
     }
+    tc_ce_fwd(c->logits, targets, c->probs, &total_loss, &n_active, T, V);
     if (targets && out_loss) *out_loss = n_active > 0 ? (total_loss / (float)n_active) : 0.0f;
 }
 
@@ -847,18 +680,13 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
                                 float *out_dx0) {
     TCConfig cfg = p->cfg;
     int D = cfg.d_model, H = cfg.n_heads, Dh = D / H, FFD = cfg.ff_mult * D;
-    float invsqrt_dh = 1.0f / sqrtf((float)Dh);
 
     TCCache *dc = tc_cache_create(cfg);
     dc->T = T;
     float *dx_final = calloc((size_t)T * D, sizeof(float)); /* grad w.r.t. final block output */
 
-    for (int t = 0; t < T; t++) {
-        rmsnorm_backward(dln_f_out + (size_t)t * D, c->ln_f_xhat + (size_t)t * D, p->ln_f_gamma,
-                    c->ln_f_rms[t], D,
-                    grad ? grad->ln_f_gamma : NULL,
-                    dx_final + (size_t)t * D);
-    }
+    tc_rmsnorm_bwd(dln_f_out, c->ln_f_xhat, p->ln_f_gamma, c->ln_f_rms, T, D,
+                   grad ? grad->ln_f_gamma : NULL, dx_final);
 
     float *dx_next = dx_final; /* grad w.r.t. output of layer l (resid3) */
 
@@ -876,15 +704,10 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
             float dhsilu[TC_MAX_FF_DIM] = {0};
             matvec_backward(lv->cm_Wdown, glv ? glv->cm_Wdown : NULL, lc->h_silu + (size_t)t * FFD, dhsilu, dlc->cm_out + (size_t)t * D, D, FFD);
             
-            float dhgate[TC_MAX_FF_DIM];
-            float dhup[TC_MAX_FF_DIM];
-            for (int i = 0; i < FFD; i++) {
-                float g = lc->h_gate[(size_t)t * FFD + i];
-                float s = sigmoidf_(g);
-                float up = lc->h_up[(size_t)t * FFD + i];
-                dhup[i] = dhsilu[i] * (g * s);
-                dhgate[i] = dhsilu[i] * up * (s + g * s * (1.0f - s));
-            }
+            float dhgate[TC_MAX_FF_DIM] = {0};
+            float dhup[TC_MAX_FF_DIM] = {0};
+            tc_swiglu_bwd(dhsilu, lc->h_gate + (size_t)t * FFD, lc->h_up + (size_t)t * FFD, dhgate, dhup, 1, FFD);
+
             float dcmxgate[TC_MAX_D_MODEL] = {0};
             float dcmxup[TC_MAX_D_MODEL] = {0};
             matvec_backward(lv->cm_Wgate, glv ? glv->cm_Wgate : NULL, lc->cmxgate + (size_t)t * D, dcmxgate, dhgate, FFD, D);
@@ -908,12 +731,8 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
                 }
             }
         }
-        for (int t = 0; t < T; t++) {
-            rmsnorm_backward(dlc->ln3_out + (size_t)t * D, lc->ln3_xhat + (size_t)t * D, lv->ln3_gamma,
-                        lc->ln3_rms[t], D,
-                        glv ? glv->ln3_gamma : NULL,
-                        dlc->resid2 + (size_t)t * D);
-        }
+        tc_rmsnorm_bwd(dlc->ln3_out, lc->ln3_xhat, lv->ln3_gamma, lc->ln3_rms, T, D,
+                       glv ? glv->ln3_gamma : NULL, dlc->resid2);
 
         /* resid2 = resid1 + attn_out */
         memcpy(dlc->resid1, dlc->resid2, (size_t)T * D * sizeof(float));
@@ -923,44 +742,17 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
             matvec_backward(lv->at_Wo, glv ? glv->at_Wo : NULL, lc->attn_ctx + (size_t)t * D,
                              dlc->attn_ctx + (size_t)t * D, dlc->attn_out + (size_t)t * D, D, D);
 
-        int kv_D = (D / H) * cfg.n_kv_heads;
-        int kv_Dh = D / H;
-        for (int h = 0; h < H; h++) {
-            int kv_h = h / (H / cfg.n_kv_heads);
-            for (int t = 0; t < T; t++) {
-                const float *dctx = dlc->attn_ctx + (size_t)t * D + h * Dh;
-                const float *wrow = lc->attn_w + ((size_t)h * T + t) * T;
-                float dw[4096];
-                for (int u = 0; u <= t; u++) {
-                    const float *vh = lc->V + (size_t)u * kv_D + kv_h * kv_Dh;
-                    float *dvh = dlc->V + (size_t)u * kv_D + kv_h * kv_Dh;
-                    float s = 0.0f;
-                    for (int i = 0; i < Dh; i++) { s += dctx[i] * vh[i]; dvh[i] += wrow[u] * dctx[i]; }
-                    dw[u] = s;
-                }
-                float dot = 0.0f;
-                for (int u = 0; u <= t; u++) dot += wrow[u] * dw[u];
-                float *dqh = dlc->Q + (size_t)t * D + h * Dh;
-                for (int u = 0; u <= t; u++) {
-                    float ds = wrow[u] * (dw[u] - dot) * invsqrt_dh;
-                    const float *kh = lc->K + (size_t)u * kv_D + kv_h * kv_Dh;
-                    float *dkh = dlc->K + (size_t)u * kv_D + kv_h * kv_Dh;
-                    const float *qh = lc->Q + (size_t)t * D + h * Dh;
-                    for (int i = 0; i < Dh; i++) { dqh[i] += ds * kh[i]; dkh[i] += ds * qh[i]; }
-                }
-            }
-        }
+        tc_attn_bwd(dlc->attn_ctx, lc->attn_w, lc->Q, lc->K, lc->V, dlc->Q, dlc->K, dlc->V, T, D, H, cfg.n_kv_heads);
 
-        for (int t = 0; t < T; t++) {
-            rope_backward(dlc->Q + (size_t)t * D, dlc->K + (size_t)t * kv_D, t, D, H, cfg.n_kv_heads);
+        for (int t = T - 1; t >= 0; t--) {
+            rope_backward(dlc->Q + (size_t)t * D, dlc->K + (size_t)t * (D/H * cfg.n_kv_heads), t, D, H, cfg.n_kv_heads);
             float *dln2 = dlc->ln2_out + (size_t)t * D;
             matvec_backward(lv->at_Wq, glv ? glv->at_Wq : NULL, lc->ln2_out + (size_t)t * D, dln2, dlc->Q + (size_t)t * D, D, D);
-            matvec_backward(lv->at_Wk, glv ? glv->at_Wk : NULL, lc->ln2_out + (size_t)t * D, dln2, dlc->K + (size_t)t * kv_D, kv_D, D);
-            matvec_backward(lv->at_Wv, glv ? glv->at_Wv : NULL, lc->ln2_out + (size_t)t * D, dln2, dlc->V + (size_t)t * kv_D, kv_D, D);
-            rmsnorm_backward(dln2, lc->ln2_xhat + (size_t)t * D, lv->ln2_gamma, lc->ln2_rms[t], D,
-                        glv ? glv->ln2_gamma : NULL,
-                        dlc->resid1 + (size_t)t * D);
+            matvec_backward(lv->at_Wk, glv ? glv->at_Wk : NULL, lc->ln2_out + (size_t)t * D, dln2, dlc->K + (size_t)t * (D/H * cfg.n_kv_heads), (D/H * cfg.n_kv_heads), D);
+            matvec_backward(lv->at_Wv, glv ? glv->at_Wv : NULL, lc->ln2_out + (size_t)t * D, dln2, dlc->V + (size_t)t * (D/H * cfg.n_kv_heads), (D/H * cfg.n_kv_heads), D);
         }
+        tc_rmsnorm_bwd(dlc->ln2_out, lc->ln2_xhat, lv->ln2_gamma, lc->ln2_rms, T, D,
+                       glv ? glv->ln2_gamma : NULL, dlc->resid1);
 
         /* resid1 = x0 + tm_out */
         memcpy(dlc->x0, dlc->resid1, (size_t)T * D * sizeof(float));
@@ -970,38 +762,23 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
             matvec_backward(lv->tm_Wo, glv ? glv->tm_Wo : NULL, lc->wkv + (size_t)t * D,
                              dlc->wkv + (size_t)t * D, dlc->tm_out + (size_t)t * D, D, D);
 
-        /* recurrence backward, reverse time order (state[t] depends on state[t-1]) */
-        for (int t = T - 1; t >= 0; t--) {
-            const float *rs = lc->r_sig + (size_t)t * D;
-            const float *st = lc->state + (size_t)t * D;
-            float *dwkv = dlc->wkv + (size_t)t * D;
-            float drs[TC_MAX_D_MODEL], dst[TC_MAX_D_MODEL];
-            for (int i = 0; i < D; i++) {
-                drs[i] = dwkv[i] * st[i];
-                dst[i] = dwkv[i] * rs[i] + dlc->state[(size_t)t * D + i]; /* += grad flowing from state[t+1] */
-            }
-            float drpre[TC_MAX_D_MODEL];
-            for (int i = 0; i < D; i++) drpre[i] = drs[i] * rs[i] * (1 - rs[i]);
-            float dxr_lin[TC_MAX_D_MODEL] = {0};
-            matvec_backward(lv->tm_Wr, glv ? glv->tm_Wr : NULL, lc->xr + (size_t)t * D, dxr_lin, drpre, D, D);
+        float *drpre = dlc->h_gate; /* alias, size T*D, free after CM bwd */
+        float *dk = dlc->h_up;      /* alias */
+        float *dv = dlc->h_silu;    /* alias */
+        float ddecay[TC_MAX_D_MODEL] = {0};
+        tc_wkv_bwd(dlc->wkv, lc->k, lc->v, lc->r_sig, lv->tm_decay, lc->state, dlc->state, drpre, dk, dv, glv ? ddecay : NULL, T, D);
+        
+        if (glv) {
+            for (int i = 0; i < D; i++) glv->tm_decay[i] += ddecay[i];
+        }
 
-            const float *kt = lc->k + (size_t)t * D, *vt = lc->v + (size_t)t * D;
-            float dk[TC_MAX_D_MODEL], dv[TC_MAX_D_MODEL];
-            for (int i = 0; i < D; i++) {
-                float decay = sigmoidf_(lv->tm_decay[i]);
-                float sp = t > 0 ? lc->state[(size_t)(t - 1) * D + i] : 0.0f;
-                float dgate = 1 - decay;
-                dk[i] = dst[i] * dgate * vt[i];
-                dv[i] = dst[i] * dgate * kt[i];
-                if (t > 0) dlc->state[(size_t)(t - 1) * D + i] += dst[i] * decay;
-                if (glv) {
-                    float ddecay_pre = dst[i] * (sp - kt[i] * vt[i]) * decay * (1 - decay);
-                    glv->tm_decay[i] += ddecay_pre;
-                }
-            }
+        for (int t = T - 1; t >= 0; t--) {
+            float dxr_lin[TC_MAX_D_MODEL] = {0};
+            matvec_backward(lv->tm_Wr, glv ? glv->tm_Wr : NULL, lc->xr + (size_t)t * D, dxr_lin, drpre + (size_t)t * D, D, D);
+
             float dxk_lin[TC_MAX_D_MODEL] = {0}, dxv_lin[TC_MAX_D_MODEL] = {0};
-            matvec_backward(lv->tm_Wk, glv ? glv->tm_Wk : NULL, lc->xk + (size_t)t * D, dxk_lin, dk, D, D);
-            matvec_backward(lv->tm_Wv, glv ? glv->tm_Wv : NULL, lc->xv + (size_t)t * D, dxv_lin, dv, D, D);
+            matvec_backward(lv->tm_Wk, glv ? glv->tm_Wk : NULL, lc->xk + (size_t)t * D, dxk_lin, dk + (size_t)t * D, D, D);
+            matvec_backward(lv->tm_Wv, glv ? glv->tm_Wv : NULL, lc->xv + (size_t)t * D, dxv_lin, dv + (size_t)t * D, D, D);
 
             float cur_k[TC_MAX_D_MODEL], cur_v[TC_MAX_D_MODEL], cur_r[TC_MAX_D_MODEL];
             float prev_k[TC_MAX_D_MODEL] = {0}, prev_v[TC_MAX_D_MODEL] = {0}, prev_r[TC_MAX_D_MODEL] = {0};
@@ -1029,11 +806,8 @@ static void tc_encode_backward(const TCParamSet *p, TCParamSet *grad, const TCCa
                 }
             }
         }
-        for (int t = 0; t < T; t++)
-            rmsnorm_backward(dlc->ln1_out + (size_t)t * D, lc->ln1_xhat + (size_t)t * D, lv->ln1_gamma,
-                        lc->ln1_rms[t], D,
-                        glv ? glv->ln1_gamma : NULL,
-                        dlc->x0 + (size_t)t * D);
+        tc_rmsnorm_bwd(dlc->ln1_out, lc->ln1_xhat, lv->ln1_gamma, lc->ln1_rms, T, D,
+                       glv ? glv->ln1_gamma : NULL, dlc->x0);
 
         if (l > 0) {
             dx_next = dc->layers[l - 1].resid3; /* alias: previous layer's output grad */
@@ -1066,17 +840,11 @@ void tc_backward_ex(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
     for (int t = 0; t < T; t++) {
         if (targets[t] >= 0) n_active++;
     }
-    float inv_n = n_active > 0 ? (1.0f / (float)n_active) : 0.0f;
+    float *dlogits = calloc((size_t)T * V, sizeof(float));
+    tc_ce_bwd(c->probs, targets, dlogits, n_active, 1.0f, T, V);
 
     for (int t = 0; t < T; t++) {
-        int target = targets[t];
-        if (target < 0) continue;
-
-        float dlogit[4096];
-        const float *prob = c->probs + (size_t)t * V;
-        for (int i = 0; i < V; i++) dlogit[i] = prob[i] * inv_n;
-        dlogit[target] -= inv_n;
-
+        float *dlogit = dlogits + (size_t)t * V;
         float *dlnf = dln_f_out + (size_t)t * D;
         for (int o = 0; o < V; o++) {
             float dlo = dlogit[o];
@@ -1093,6 +861,7 @@ void tc_backward_ex(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
             }
         }
     }
+    free(dlogits);
     tc_encode_backward(p, grad, c, ids, T, dln_f_out, out_dx0);
     free(dln_f_out);
 }
@@ -1118,17 +887,12 @@ void tc_backward_ul(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
     }
     float inv_n = n_active > 0 ? (1.0f / (float)n_active) : 0.0f;
 
-    for (int t = 0; t < T; t++) {
-        float dlogit[4096];
-        const float *prob = c->probs + (size_t)t * V;
-        memset(dlogit, 0, (size_t)V * sizeof(float));
+    float *dlogits = calloc((size_t)T * V, sizeof(float));
+    tc_ce_bwd(c->probs, targets, dlogits, n_active, 1.0f, T, V);
 
-        /* Standard attractive gradient */
-        int target = targets[t];
-        if (target >= 0) {
-            for (int i = 0; i < V; i++) dlogit[i] = prob[i] * inv_n;
-            dlogit[target] -= inv_n;
-        }
+    for (int t = 0; t < T; t++) {
+        float *dlogit = dlogits + (size_t)t * V;
+        const float *prob = c->probs + (size_t)t * V;
 
         /* Unlikelihood repulsive gradient */
         if (targets_neg && targets_neg[t] >= 0 && ul_weight > 0.0f) {
@@ -1158,6 +922,7 @@ void tc_backward_ul(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
                 dlnf[i] += erow[i] * dlo;
         }
     }
+    free(dlogits);
     tc_encode_backward(p, grad, c, ids, T, dln_f_out, NULL);
     free(dln_f_out);
 }
@@ -1176,16 +941,12 @@ void tc_backward_mtp(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
 
     int n_active = 0;
     for (int t = 0; t < T; t++) if (targets && targets[t] >= 0) n_active++;
-    float inv_n = n_active > 0 ? (1.0f / (float)n_active) : 0.0f;
+    float *dlogits = calloc((size_t)T * V, sizeof(float));
+    tc_ce_bwd(c->probs, targets, dlogits, n_active, 1.0f, T, V);
 
     /* 1. Standard t+1 backward */
     for (int t = 0; t < T; t++) {
-        if (!targets || targets[t] < 0) continue;
-        float dlogit[4096];
-        const float *prob = c->probs + (size_t)t * V;
-        for (int i = 0; i < V; i++) dlogit[i] = prob[i] * inv_n;
-        dlogit[targets[t]] -= inv_n;
-
+        float *dlogit = dlogits + (size_t)t * V;
         float *dlnf = dln_f_out + (size_t)t * D;
         for (int o = 0; o < V; o++) {
             float dlo = dlogit[o];
@@ -1199,6 +960,7 @@ void tc_backward_mtp(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
             for (int i = 0; i < D; i++) dlnf[i] += erow[i] * dlo;
         }
     }
+    free(dlogits);
 
     /* 2. MTP backward (t+2, t+3) */
     if (mtp_weight > 0.0f) {
@@ -1212,25 +974,17 @@ void tc_backward_mtp(const TCParamSet *p, TCParamSet *grad, const TCCache *c,
             if (!tgt_arrays[head]) continue;
             int mtp_active = 0;
             for (int t = 0; t < T; t++) if (tgt_arrays[head][t] >= 0) mtp_active++;
-            float mtp_inv_n = mtp_active > 0 ? (mtp_weight / (float)mtp_active) : 0.0f;
             if (mtp_active == 0) continue;
+
+            float *dlogits = calloc((size_t)T * V, sizeof(float));
+            tc_ce_bwd(prob_bufs[head], tgt_arrays[head], dlogits, mtp_active, mtp_weight, T, V);
 
             const float *W = W_vals[head];
             float *dW = W_grads[head];
             const float *h_buf = h_bufs[head];
-            const float *probs_out = prob_bufs[head];
 
             for (int t = 0; t < T; t++) {
-                int tgt = tgt_arrays[head][t];
-                if (tgt < 0) continue;
-
-                /* a) dLoss/dLogits for this MTP head */
-                float dlogit[4096];
-                const float *prob = probs_out + (size_t)t * V;
-                for (int i = 0; i < V; i++) dlogit[i] = prob[i] * mtp_inv_n;
-                dlogit[tgt] -= mtp_inv_n;
-
-                /* b) Backprop through tied embedding projection: logits = h @ embed^T */
+                float *dlogit = dlogits + (size_t)t * V;
                 float dh[1024]; /* D_MAX */
                 memset(dh, 0, D * sizeof(float));
                 for (int o = 0; o < V; o++) {

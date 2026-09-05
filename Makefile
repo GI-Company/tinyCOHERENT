@@ -1,12 +1,14 @@
 CC = cc
 CFLAGS = -O2 -Wall -Wextra -std=c11 -Isrc
 LDLIBS = -lm
+SRC = src/tcmodel.c src/optim.c src/tokenizer.c src/tc_ops.c
+
 ifeq ($(shell uname),Darwin)
 CFLAGS += -DACCELERATE_NEW_LAPACK
-LDLIBS += -framework Accelerate
+LDLIBS += -framework Accelerate -framework Metal -framework Foundation -framework MetalPerformanceShaders
+SRC += src/tc_metal.m
 endif
 
-SRC = src/tcmodel.c src/optim.c src/tokenizer.c
 BUILD = build
 
 .PHONY: all gradcheck embed_gradcheck train train_scale train_rung6 train_rung6_continue embed_train dag embed rag faithcheck faithcheck_rung4 faithcheck_rung6 known_answer chat chat_rung6 clean
@@ -132,4 +134,17 @@ test_steer: $(BUILD)/test_steer
 	./$(BUILD)/test_steer build/model_sft.bin data/bpe_merges.txt
 
 clean:
-	rm -f $(BUILD)/gradcheck $(BUILD)/embed_gradcheck $(BUILD)/train $(BUILD)/embed_train $(BUILD)/dag_demo $(BUILD)/embed_demo $(BUILD)/rag_demo $(BUILD)/faithcheck $(BUILD)/known_answer $(BUILD)/chat $(BUILD)/degrade_test $(BUILD)/train_scale $(BUILD)/train_sft $(BUILD)/server $(BUILD)/steer_extract_bank $(BUILD)/test_steer
+	rm -f $(BUILD)/gradcheck $(BUILD)/embed_gradcheck $(BUILD)/train $(BUILD)/embed_train $(BUILD)/dag_demo $(BUILD)/embed_demo $(BUILD)/rag_demo $(BUILD)/faithcheck $(BUILD)/known_answer $(BUILD)/chat $(BUILD)/degrade_test $(BUILD)/train_scale $(BUILD)/train_sft $(BUILD)/server $(BUILD)/steer_extract_bank $(BUILD)/test_steer $(BUILD)/metalcheck
+
+METAL ?= 0
+ifeq ($(METAL),1)
+CFLAGS += -DTC_METAL
+LDLIBS += -framework Metal -framework Foundation -framework MetalPerformanceShaders
+METAL_SRC = src/tc_metal.m
+endif
+
+$(BUILD)/metalcheck: $(SRC) src/tc_metal.m src/tc_metalcheck.c
+	$(CC) $(CFLAGS) -DTC_METAL -fobjc-arc -o $@ $^ $(LDLIBS) -framework Metal -framework Foundation -framework MetalPerformanceShaders
+
+metalcheck: $(BUILD)/metalcheck
+	./$(BUILD)/metalcheck

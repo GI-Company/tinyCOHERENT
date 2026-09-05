@@ -6,6 +6,7 @@
 #include "tokenizer.h"
 #include "bpe.h"
 #include "glassbox.h"
+#include "tc_metal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,6 +110,12 @@ int main(int argc, char **argv) {
                 num_steps = 20000;
             } else if (strcmp(argv[i], "--corpus") == 0 && i + 1 < argc) {
                 corpus_path = argv[++i];
+            } else if (strcmp(argv[i], "--metal") == 0) {
+                tc_metal_available();
+            } else if (strcmp(argv[i], "--metal-gemm") == 0) {
+                tc_metal_available();
+                tc_use_metal_gemm = 1;
+                printf("--- PARSED --metal-gemm ---\n");
             } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
                 num_steps = atoi(argv[++i]);
             } else if (strcmp(argv[i], "--dim") == 0 && i + 1 < argc) {
@@ -213,6 +220,7 @@ int main(int argc, char **argv) {
     TCAdam *adam = tc_adam_create(cfg, base_lr, 0.01f);
 
     int batch_size = 8;
+    // (Removed Metal batch_size = 1 limitation since it's now fully batched natively on MSL)
     if (accum_steps > 1)
         printf("gradient accumulation: %d steps (effective batch = %d)\n", accum_steps, batch_size * accum_steps);
     if (mtp_weight > 0.0f)
@@ -224,11 +232,23 @@ int main(int argc, char **argv) {
     TCParamSet *grads[8];
     TCCache *caches[8];
     unsigned int thread_seeds[8];
+    
+#ifdef __APPLE__
+    tc_metal_init(&cfg);
+    tc_metal_bind_params(p, NULL);
+#endif
+    
     for (int b = 0; b < batch_size; b++) {
         grads[b] = tc_paramset_create(cfg);
         caches[b] = tc_cache_create(cfg);
         thread_seeds[b] = 12345 + b * 997;
+#ifdef __APPLE__
+        tc_metal_bind_params(NULL, grads[b]);
+        tc_metal_bind_cache(caches[b]);
+#endif
     }
+
+    TCParamSet *global_grad = tc_paramset_create(cfg);
 
     double t0 = get_time_sec();
     float running_loss = 0.0f;
@@ -238,59 +258,62 @@ int main(int argc, char **argv) {
     TCParamSet **grads_ptr = grads;
     TCCache **caches_ptr = caches;
     unsigned int *seeds_ptr = thread_seeds;
-    float batch_losses[8];
+    float *batch_losses;
+    posix_memalign((void**)&batch_losses, 16384, ((8 * sizeof(float)) + 16383) & ~16383);
     float *losses_ptr = batch_losses;
+    
+    int *batch_ids;
+    posix_memalign((void**)&batch_ids, 16384, ((batch_size * chunk_len * sizeof(int)) + 16383) & ~16383);
+    int *batch_targets;
+    posix_memalign((void**)&batch_targets, 16384, ((batch_size * chunk_len * sizeof(int)) + 16383) & ~16383);
+
+#ifdef __APPLE__
+    tc_metal_register_ptr(batch_losses, 8 * sizeof(float));
+    tc_metal_register_ptr(batch_ids, batch_size * chunk_len * sizeof(int));
+    tc_metal_register_ptr(batch_targets, batch_size * chunk_len * sizeof(int));
+#endif
 
     for (int step = 1; step <= num_steps; step++) {
         /* --- gradient accumulation outer loop --- */
         float step_loss = 0.0f;
-        tc_paramset_zero(grads[0]);
+        tc_paramset_zero(global_grad);
         for (int accum = 0; accum < accum_steps; accum++) {
 #ifdef __APPLE__
-            /* Each accum step runs a full parallel micro-batch */
-            for (int b = 0; b < batch_size; b++) tc_paramset_zero(grads_ptr[b]);
-            dispatch_apply(batch_size, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(size_t b) {
-                long max_off = train_len - chunk_len - 3; /* -3 to allow MTP t+2, t+3 targets */
+            /* Metal batched dispatch */
+            for (int b = 0; b < batch_size; b++) {
+                tc_paramset_zero(grads_ptr[b]);
+                batch_losses[b] = 0.0f;
+            }
+            
+            for (int b = 0; b < batch_size; b++) {
+                long max_off = train_len - chunk_len - 3;
                 if (max_off < 1) max_off = 1;
                 long off = ((long)rand_r(&seeds_ptr[b])) % max_off;
                 
-                int local_ids[1024], local_targets[1024], local_t2[1024], local_t3[1024];
+                int *local_ids = batch_ids + b * chunk_len;
+                int *local_targets = batch_targets + b * chunk_len;
+                
                 for (int i = 0; i < chunk_len; i++) {
                     local_ids[i] = train_tokens[off + i];
                 }
-
+                
                 if (ponder_rate > 0.0f && ((float)(rand_r(&seeds_ptr[b]) % 10000) / 10000.0f) < ponder_rate) {
                     int pos = rand_r(&seeds_ptr[b]) % (chunk_len - 1);
                     for (int i = chunk_len - 1; i > pos; i--) local_ids[i] = local_ids[i - 1];
                     local_ids[pos] = ponder_token_id;
                 }
-
+                
                 for (int i = 0; i < chunk_len; i++) {
                     local_targets[i] = (i + 1 < chunk_len) ? local_ids[i + 1] : train_tokens[off + chunk_len];
-                    local_t2[i] = (i + 2 < chunk_len) ? local_ids[i + 2] : train_tokens[off + chunk_len + 1];
-                    local_t3[i] = (i + 3 < chunk_len) ? local_ids[i + 3] : train_tokens[off + chunk_len + 2];
                 }
-
-                const int *ids = local_ids;
-                const int *targets = local_targets;
-                const int *targets_t2 = local_t2;
-                const int *targets_t3 = local_t3;
-                float loss;
-
-                if (mtp_weight > 0.0f) {
-                    tc_forward_mtp(p, caches_ptr[b], ids, chunk_len, targets, targets_t2, targets_t3, mtp_weight, &loss);
-                    tc_backward_mtp(p, grads_ptr[b], caches_ptr[b], ids, chunk_len, targets, targets_t2, targets_t3, mtp_weight);
-                } else {
-                    tc_forward(p, caches_ptr[b], ids, chunk_len, targets, &loss);
-                    tc_backward(p, grads_ptr[b], caches_ptr[b], ids, chunk_len, targets);
-                }
-                losses_ptr[b] = loss;
-            });
+            }
+            
+            tc_metal_forward(p, caches_ptr, batch_ids, batch_size, chunk_len, batch_targets, losses_ptr);
+            tc_metal_backward(p, grads_ptr, caches_ptr, batch_ids, batch_size, chunk_len, batch_targets);
 
             for (int b = 0; b < batch_size; b++) {
                 step_loss += batch_losses[b];
-                if (accum == 0 && b == 0) continue; /* grads[0] already has its own batch */
-                for (int i = 0; i < p->n_floats; i++) grads[0]->buf[i] += grads[b]->buf[i];
+                for (int i = 0; i < p->n_floats; i++) global_grad->buf[i] += grads_ptr[b]->buf[i];
             }
 #else
             float micro_loss = 0.0f;
@@ -324,10 +347,10 @@ int main(int argc, char **argv) {
 
                 if (mtp_weight > 0.0f) {
                     tc_forward_mtp(p, caches[0], ids, chunk_len, targets, targets_t2, targets_t3, mtp_weight, &loss);
-                    tc_backward_mtp(p, grads[0], caches[0], ids, chunk_len, targets, targets_t2, targets_t3, mtp_weight);
+                    tc_backward_mtp(p, global_grad, caches[0], ids, chunk_len, targets, targets_t2, targets_t3, mtp_weight);
                 } else {
                     tc_forward(p, caches[0], ids, chunk_len, targets, &loss);
-                    tc_backward(p, grads[0], caches[0], ids, chunk_len, targets);
+                    tc_backward(p, global_grad, caches[0], ids, chunk_len, targets);
                 }
                 micro_loss += loss;
             }
@@ -335,13 +358,23 @@ int main(int argc, char **argv) {
 #endif
         } /* end accum loop */
         float total_microbatches = (float)(batch_size * accum_steps);
-        scale_grad(grads[0], 1.0f / total_microbatches);
+        scale_grad(global_grad, 1.0f / total_microbatches);
+
+        /* Global Gradient Clipping */
+        float l2_norm = 0.0f;
+        for (int i = 0; i < p->n_floats; i++) {
+            l2_norm += global_grad->buf[i] * global_grad->buf[i];
+        }
+        l2_norm = sqrtf(l2_norm);
+        if (l2_norm > 1.0f) {
+            scale_grad(global_grad, 1.0f / l2_norm);
+        }
 
         /* Cosine learning rate schedule */
         float progress = (float)step / (float)num_steps;
         adam->lr = min_lr + 0.5f * (base_lr - min_lr) * (1.0f + cosf(3.14159265f * progress));
 
-        tc_adam_step(adam, p, grads[0]);
+        tc_adam_step(adam, p, global_grad);
         step_loss /= total_microbatches;
         running_loss = (step == 1) ? step_loss : 0.98f * running_loss + 0.02f * step_loss;
 

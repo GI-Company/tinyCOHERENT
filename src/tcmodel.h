@@ -103,6 +103,8 @@ typedef struct {
 typedef struct {
     TCConfig cfg;
     int T;
+    float *buf;
+    int n_floats;
     TCLayerCache *layers;   /* n_layers */
     float *ln_f_rms;        /* T */
     float *ln_f_out;                /* T x D */
@@ -124,6 +126,8 @@ typedef struct {
 
 TCCache *tc_cache_create(TCConfig cfg);
 void tc_cache_free(TCCache *c);
+
+extern int tc_use_metal_gemm;
 
 /* Forward pass over token ids[0..T-1]; fills cache (T <= cfg.max_seq_len).
  * If targets != NULL (next-token ids, length T), also computes mean
